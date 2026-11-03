@@ -1,0 +1,16 @@
+{
+  "card": {
+    "reading_preset": "task",
+    "native_tables": true,
+    "show_reasoning": true,
+    "timeline_order": "newest_first",
+    "timeline_expanded": false,
+    "max_timeline_items": 12,
+    "max_tool_result_chars": 600,
+    "table_overflow_mode": "compact",
+    "footer_fields": ["duration", "model", "input_tokens", "output_tokens", "context"]
+  },
+  "bindings": {
+    "native_chats": []
+  }
+}
