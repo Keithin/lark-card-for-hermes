@@ -8,4 +8,16 @@ description: >
   it; any card failure falls back to the bundled text path.
 author: Keithin
 homepage: https://github.com/Keithin/lark-card-for-hermes
+requires_hermes: ">=0.22.0"
+provides_hooks:
+  - post_gateway_admission
+  - pre_tool_call
+  - post_tool_call
+  - subagent_start
+  - subagent_stop
+  - on_session_end
+  - on_stream_delta
+  - agent_loop_stopped
+  - post_api_request
+  - post_llm_call
 kind: platform
