@@ -1,5 +1,5 @@
 name: feishu-card
-version: 1.5.6
+version: 1.5.8
 description: >
   Lark Card for Hermes: renders Feishu/Lark outbound messages as interactive cards (cardkit streaming,
   tool timeline, reasoning panel, native tables, token footer) by replacing only the bundled Feishu

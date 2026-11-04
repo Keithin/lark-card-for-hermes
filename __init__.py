@@ -488,7 +488,8 @@ def _build_adapter_class(base: Any) -> type:
                 await base.FeishuAdapter.edit_message(
                     self, state["chat_id"], state["message_id"], notice or "该问题已失效，请重新提问。")
             except Exception as exc:
-                logger.debug("[feishu-card] retire clarify card failed: %s", exc)
+                # 撤按钮失败不该静默：卡上会留下点不动的按钮，要能被看见
+                logger.warning("[feishu-card] retire clarify card failed: %s", exc)
 
         async def connect(self, *, is_reconnect: bool = False) -> bool:
             ok = await super().connect(is_reconnect=is_reconnect)
@@ -504,18 +505,23 @@ def _build_adapter_class(base: Any) -> type:
             return self._cardkit
 
         def _delivery_key(self, chat_id: str) -> str:
-            """一个回合一个投递键：优先用 HFC 的 canonical turn id，取不到再退回 chat+回合起点。
+            """一个回合一个投递键：回合存活时用 HFC 的 canonical turn id，否则每次新键。
 
-            `started` 的初值是 0.0；admission 之前的通知（启动横幅）会走到这里，
-            那时退回 `time.monotonic()` 并写回，保证同一回合内稳定、且不会和真实回合共用 key。
+            回合结束后 canonical frame 并未失效，`consume` 仍会返回旧 id；继续拿它当键
+            会把新消息绑到已绑定的 cardkit 卡上，飞书回 200780（card binding biz count
+            over limit），于是回落 v1 卡，markdown 表格/标题变成裸文本。
             """
-            turn = consume_canonical_turn_id()
-            if turn:
-                return turn
             with _LOCK:
-                started = _TURN.get("started") or 0.0
-                if not started:
-                    started = _TURN["started"] = time.monotonic()
+                live = bool(_TURN.get("chat")) and not _TURN.get("final")
+                turn = consume_canonical_turn_id() if live else None
+                if turn:
+                    return turn
+                if live:
+                    started = _TURN.get("started") or 0.0
+                    if not started:
+                        started = _TURN["started"] = time.monotonic()
+                else:
+                    started = time.monotonic()
             return f"{chat_id}:{started}"
 
         # ── 单卡合并（进度气泡 + 答复卡共用一张消息）─────────────────────────────
@@ -580,7 +586,9 @@ def _build_adapter_class(base: Any) -> type:
             is_progress = MERGE_TOOL_CARD and looks_like_progress(formatted, self._tool_lines)
             logger.info("[feishu-card] send chat=%s len=%d progress=%s known=%d",
                         chat_id, len(formatted), is_progress, len(self._tool_lines))
-            if MERGE_TOOL_CARD and _TURN["chat"] == chat_id:
+            # 回合已收尾（final）就不能再合并：否则回合外的同 chat 消息（定时任务/通知）
+            # 会被当成本回合第二次 send，直接改写上一条答复卡。
+            if MERGE_TOOL_CARD and _TURN["chat"] == chat_id and not _TURN["final"]:
                 existing = self._turn_card_id(chat_id)
                 if existing and self._cardkit is not None:
                     # 本回合已有卡：第二次 send 转成对同一张卡的更新（网关会 adopt 返回的 id）
