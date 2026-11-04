@@ -326,7 +326,9 @@ def _render_card_unchecked(
         footer_fields,
         display_status=display_status,
         compact=presentation == "task",
-        include_status=presentation != "task" or native_reply_completed,
+        # Local change 2026-11-04 (禹钊): pill stays on in task mode too — HFC's reference gates it
+        # off there because the header carries the state; user wants the footer color back.
+        include_status=True,
         # Maintainer note (contract change): the footer no longer repeats "本轮回复结束" at all.
         # The user asked for it to go from the footer ("footer 区域不显示本轮回复结束"), and only
         # the native-reply rail ever had it there — that rail drops the whole header
@@ -2748,7 +2750,8 @@ def _render_footer(
         return pill
     values = {
         "duration": _format_duration(duration),
-        "model": html.escape(model, quote=True) if compact else _colored_model_label(model),
+        # Local change 2026-11-04: model colored even in task/compact mode (_colored_model_label escapes internally).
+        "model": _colored_model_label(model),
         "input_tokens": f"↑{_format_count(input_tokens)}",
         "output_tokens": f"↓{_format_count(output_tokens)}",
         "context": (

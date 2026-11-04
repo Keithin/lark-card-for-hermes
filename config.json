@@ -1,6 +1,6 @@
 {
   "card": {
-    "reading_preset": "task",
+    "reading_preset": "classic",
     "native_tables": true,
     "show_reasoning": true,
     "timeline_order": "newest_first",

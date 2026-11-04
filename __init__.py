@@ -31,10 +31,11 @@ from typing import Any, Optional
 
 # HFC 的渲染/状态机原样复用（hfc/ 下是从 HFC 备份整份搬来的模块，见 hfc/bridge.py 说明）。
 try:
-    from .hfc.bridge import HfcTurnBridge
+    from .hfc.bridge import HfcTurnBridge, load_card_config
     from .hfc.cardkit import CardKitTransport
     from .hfc.canonical_turn import consume_canonical_turn_id, publish_canonical_turn_id
     from .hfc.client import RestClient
+    from .hfc.config_rules import READING_PRESETS, normalize_reading_preset
     from .hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from .hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
     from .hfc.interaction_input import InteractionInputError, parse_choice
@@ -42,10 +43,11 @@ try:
     from .hfc.transient_notices import is_transient_busy_ack, transient_notice_recall_seconds
 except ImportError:  # 判据脚本按文件路径加载插件时没有包上下文
     sys.path.insert(0, str(Path(__file__).parent))
-    from hfc.bridge import HfcTurnBridge
+    from hfc.bridge import HfcTurnBridge, load_card_config
     from hfc.cardkit import CardKitTransport
     from hfc.canonical_turn import consume_canonical_turn_id, publish_canonical_turn_id
     from hfc.client import RestClient
+    from hfc.config_rules import READING_PRESETS, normalize_reading_preset
     from hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
     from hfc.interaction_input import InteractionInputError, parse_choice
@@ -764,6 +766,75 @@ _HOOKS = (
 )
 
 
+# ── /card-preset：切换卡片阅读预设 ────────────────────────────────────────────
+# 预设管理的键（来自 READING_PRESETS）：切换时必须从 config.json 删掉，否则残留的显式旧值
+# 会覆盖新预设（「切了只生效一半」的坑，见 feishu-streaming-card-ops skill）。
+_PRESET_MANAGED_KEYS = frozenset(k for p in READING_PRESETS.values() for k in p)
+_PRESET_CHOICES: list = [
+    {"value": "classic", "label": "classic", "description": "默认·思考进正文"},
+    {"value": "focused", "label": "focused", "description": "思考进面板"},
+    {"value": "detailed", "label": "detailed", "description": "时间线展开"},
+    {"value": "task", "label": "task", "description": "任务看板"},
+]
+
+
+def _write_preset(preset: str, config_path: Optional[Path] = None) -> str:
+    """把 reading_preset 写进 config.json 并清掉预设管理的旧显式键；返回规范化名字。
+
+    非法预设名抛 ValueError（在写盘之前），I/O 失败抛 OSError。
+    """
+    name = normalize_reading_preset(preset)
+    path = config_path or (Path(__file__).parent / "config.json")
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    raw_card = cfg.get("card")
+    card = dict(raw_card) if isinstance(raw_card, dict) else {}
+    for key in _PRESET_MANAGED_KEYS:
+        card.pop(key, None)
+    card["reading_preset"] = name
+    cfg["card"] = card
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return name
+
+
+def _preset_usage(note: str = "") -> str:
+    current = (_TURNS.config or {}).get("reading_preset", "classic")
+    head = f"{note}\n" if note else ""
+    return (
+        f"{head}用法：/card-preset <classic|focused|detailed|task>（当前：{current}）\n"
+        "classic=思考进正文 · focused=思考进面板 · detailed=时间线展开 · task=任务看板"
+    )
+
+
+def _on_card_preset(raw_args: str) -> str:
+    """``/card-preset [名字]``：无参数弹选择菜单，有参数直接切换。
+
+    写 config.json 后热加载 ``_TURNS.config``——下一条消息即用新预设，无需重启网关
+    （命令本身的注册仍需一次重启才出现）。handler 必须自己接住所有异常：抛出去会被
+    派发层当成「未处理」，把命令文本转给 agent。
+    """
+    from hermes_cli.plugin_choices import ask_choice
+    arg = (raw_args or "").strip()
+    if not arg:
+        picked = ask_choice("切换卡片阅读预设", _PRESET_CHOICES)
+        if not picked:
+            return _preset_usage()
+        arg = picked
+    try:
+        name = _write_preset(arg)
+    except ValueError as exc:
+        return _preset_usage(str(exc))
+    except OSError as exc:
+        return f"写入 config.json 失败：{exc}"
+    with _TURNS_LOCK:
+        _TURNS.config = load_card_config()
+    return f"✅ 卡片预设已切换到 {name}（已写入 config.json，下一条消息生效，无需重启）"
+
+
 def register(ctx: Any) -> None:
     """Reuse the bundled ``register`` with our subclass swapped in.
 
@@ -776,3 +847,8 @@ def register(ctx: Any) -> None:
     base.register(ctx)
     for hook_name, callback in _HOOKS:
         ctx.register_hook(hook_name, callback)
+    ctx.register_command(
+        "card-preset", _on_card_preset,
+        description="切换飞书卡片阅读预设（classic/focused/detailed/task）",
+        args_hint="<classic|focused|detailed|task>",
+    )
