@@ -12,7 +12,7 @@ This is a Hermes **platform plugin**. It overrides only the Feishu adapter's out
 
 ![A real Feishu card: status header, a Markdown table rendered as a native table, and a token footer](docs/screenshot-card.png)
 
-*Screenshot taken from Feishu. The Markdown table renders as a **native table component** — header shading, cell borders, aligned columns — not a wall of `|` pipes. The footer shows duration, model and token usage.*
+*Screenshot taken from Feishu: a finished turn — status header, a Markdown table rendered as a **native table component** (header shading, cell borders, aligned columns, not a wall of `|` pipes), and the collapsible **execution panel** with every tool step. The footer shows duration, model and token usage.*
 
 ### What you get
 
@@ -139,7 +139,7 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 
 这是一个 Hermes **平台插件**：只覆写飞书 adapter 的 `send` / `edit_message` 出口，**不修改 Hermes 源码**。
 
-![飞书真实卡片：状态头 + Markdown 表格渲染成原生表格 + token footer](docs/screenshot-card.png)
+![飞书真实卡片：状态头 + Markdown 表格渲染成原生表格 + 可折叠执行过程 + token footer](docs/screenshot-card.png)
 
 *飞书实拍。Markdown 表格渲染成**原生 table 组件**——有表头底色、单元格边框、按列对齐——而不是一堆 `|` 竖线。底部 footer 是用时、模型和 token 用量。*
 

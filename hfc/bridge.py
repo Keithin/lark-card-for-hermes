@@ -68,6 +68,19 @@ except Exception:  # 脱离网关进程（判据脚本）时用同一个默认�
     _CURSOR = " ▉"
 
 
+NOTICE_TITLE_CHARS = 24
+
+
+def notice_title(text: str) -> str:
+    """回合外通知的卡片标题：正文首行去掉 markdown 记号，超长截断。"""
+    for raw in (text or "").splitlines():
+        line = raw.strip().lstrip("#>-*· ").strip()
+        if not line:
+            continue
+        return line if len(line) <= NOTICE_TITLE_CHARS else line[:NOTICE_TITLE_CHARS] + "…"
+    return ""
+
+
 def strip_cursor(text: str) -> str:
     """只剥**帧尾**的光标字符串（`cfg.cursor`，默认 " ▉"）。
 
@@ -186,6 +199,9 @@ class HfcTurnBridge:
         if chat_id not in self._sessions:
             self.start(chat_id, delivery_kind="notice" if create_notice else "chat")
             if create_notice:
+                # HFC 的 notice 卡标题来自事件自带的 title；这里没有事件源，取正文首行，
+                # 否则回合外通知永远顶着配置名（用户看到的「标题都是 Hermes」）。
+                self._sessions[chat_id].notice_title = notice_title(cumulative)
                 self.complete(chat_id)
         else:
             self._touch(chat_id)

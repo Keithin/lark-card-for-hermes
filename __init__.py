@@ -168,6 +168,26 @@ _TURN: dict[str, Any] = {"chat": None, "rows": [], "started": 0.0, "final": Fals
 _ICON = {"running": "⏳", "ok": "✅", "error": "❌"}
 
 
+def _card_title() -> str:
+    """卡片标题：配置里的 title（HFC 的 card.title），缺省 Hermes Agent。"""
+    return str((_TURNS.config or {}).get("title") or "Hermes Agent")
+
+
+def _header_for_v1(chat_id: str) -> tuple[str, str]:
+    """v1 兜底卡的标题/配色取 HFC 渲染出的 header（状态头+工具数+时长），取不到才退回配置名。"""
+    try:
+        with _TURNS_LOCK:
+            card = _TURNS.render(chat_id, streaming=False)
+        header = (card or {}).get("header") or {}
+        title = str((header.get("title") or {}).get("content") or "").strip()
+        template = str(header.get("template") or "").strip()
+        if title:
+            return title, (template or "blue")
+    except Exception:   # 渲染不可用不能挡住兜底卡
+        logger.debug("[feishu-card] v1 header fallback", exc_info=True)
+    return _card_title(), "blue"
+
+
 def _redact(text: str) -> str:
     """Hermes 自己的敏感信息脱敏（force：展示给聊天必须脱，不看 security.redact_secrets）。"""
     try:
@@ -235,7 +255,7 @@ def _stale_card(record: dict) -> Optional[dict]:
     不留按钮/流式，也不再显示执行态。
     """
     text = str(getattr(record.get("session"), "answer_text", "") or "").strip()
-    title = str((_TURNS.config or {}).get("title") or CARD_TITLE)
+    title = _card_title()
     elements = [{"tag": "markdown", "element_id": "main_content", "content": text or " "}]
     folded = collapsed_transfer_elements(elements)
     if folded is not None:
@@ -511,7 +531,7 @@ def _build_adapter_class(base: Any) -> type:
             ]
             actions.append(base._card_button("其他…", "default",
                                              {"hermes_clarify_action": "other", "clarify_id": clarify_id}))
-            return base._card(_TURNS.config.get("title") or CARD_TITLE, "blue", question, actions=actions)
+            return base._card(_card_title(), "blue", question, actions=actions)
 
         async def send_clarify(self, chat_id: str, question: str, choices: Optional[list],
                                clarify_id: str, session_key: str,
@@ -689,7 +709,9 @@ def _build_adapter_class(base: Any) -> type:
         # ── card shapes ─────────────────────────────────────────────────────────
         def _card_v1(self, chat_id: str, text: str, *, final: bool = False) -> dict:
             timeline = _timeline_text(chat_id, final=final)
-            return base._card(CARD_TITLE, "blue", f"{timeline}\n\n{text}" if timeline else (text or " "))
+            title, template = _header_for_v1(chat_id)
+            return base._card(title, template,
+                              f"{timeline}\n\n{text}" if timeline else (text or " "))
 
         def _card_v2(self, chat_id: str, text: str, *, streaming: bool) -> dict:
             """卡片由 HFC 的 `render_card` 生成（显示模式与 HFC 同一份代码）；不可用时退回最小卡。"""
@@ -705,7 +727,7 @@ def _build_adapter_class(base: Any) -> type:
                                  if el.get("element_id") == "main_content"), -1)
                 logger.info("[feishu-card] card_v2 text=%d rendered=%d", len(text or ""), body_len)
                 return card
-            return base._card(CARD_TITLE, "blue", text or " ")
+            return base._card(_card_title(), "blue", text or " ")
 
         # ── tool chrome ─────────────────────────────────────────────────────────
         def format_tool_event(self, event: Any, *, mode: str = "all", preview_max_len: int = 40):
