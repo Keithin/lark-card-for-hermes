@@ -109,7 +109,7 @@ class HfcTurnBridge:
             sequence=self._seq, created_at=time.time(), data=dict(data),
         ))
 
-    def start(self, chat_id: str, *, reply_to: str = "") -> None:
+    def start(self, chat_id: str, *, reply_to: str = "", delivery_kind: str = "live") -> None:
         """一次入站消息 = 一个回合：新 session，时间线/正文归零。"""
         self._sessions[chat_id] = CardSession(
             conversation_id=chat_id, message_id=f"turn-{chat_id}-{int(time.time() * 1000)}", chat_id=chat_id,
@@ -117,12 +117,18 @@ class HfcTurnBridge:
         self._pushed[chat_id] = 0
         self._touch(chat_id)
         self._apply(chat_id, "message.started",
-                    {"reply_to_message_id": reply_to, "delivery_kind": "live"})
+                    {"reply_to_message_id": reply_to, "delivery_kind": delivery_kind})
 
-    def answer_frame(self, chat_id: str, cumulative: str) -> None:
-        """适配器拿到的是累积正文（可能带流式光标）；HFC 要的是增量。"""
+    def answer_frame(self, chat_id: str, cumulative: str, *, create_notice: bool = False) -> None:
+        """适配器拿到的是累积正文（可能带流式光标）；HFC 要的是增量。
+
+        create_notice：回合外发送（通知/命令回复）自动建卡时按 notice 渲染并立即
+        置 completed，否则 session 停在 thinking、没有 complete 事件，卡片永远「执行中」。
+        """
         if chat_id not in self._sessions:
-            self.start(chat_id)
+            self.start(chat_id, delivery_kind="notice" if create_notice else "live")
+            if create_notice:
+                self.complete(chat_id)
         else:
             self._touch(chat_id)
         text = strip_cursor(cumulative or "")

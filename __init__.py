@@ -550,7 +550,10 @@ def _build_adapter_class(base: Any) -> type:
         def _card_v2(self, chat_id: str, text: str, *, streaming: bool) -> dict:
             """卡片由 HFC 的 `render_card` 生成（显示模式与 HFC 同一份代码）；不可用时退回最小卡。"""
             with _TURNS_LOCK:
-                _TURNS.answer_frame(chat_id, text)
+                # 回合外的发送（启动通知/cron/命令回复）不是本回合：按 notice 渲染并立即收尾，
+                # 否则新建的 session 收不到 complete，卡片永远停在「⏳ 执行中」。
+                live = _TURN["chat"] == chat_id and not _TURN["final"]
+                _TURNS.answer_frame(chat_id, text, create_notice=not live)
                 card = _TURNS.render(chat_id, streaming=streaming)
             if card:
                 body_len = next((len(el.get("content", "")) for el in
