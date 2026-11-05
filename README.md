@@ -22,8 +22,10 @@ This is a Hermes **platform plugin**. It overrides only the Feishu adapter's out
 - **Native tables** — Markdown tables become Feishu `table` components.
 - **Footer** — duration, model, input/output tokens, context usage.
 - **Streaming body** — updates as it generates, no leftover cursor glyph when it finishes.
-- **Interactive clarify** — `clarify` options render as real buttons that send the answer back; expired or superseded prompts have their buttons withdrawn.
+- **Interactive clarify** — `clarify` options render as real buttons that send the answer back; a clicked card is frozen into a static receipt (text only, no controls), and expired or superseded prompts have their buttons withdrawn.
 - **Honest out-of-turn cards** — startup/cron notifications and slash-command replies have no turn behind them, so they render as a notice card marked done instead of a card stuck on `⏳ running` with a growing clock.
+- **Crash-safe cards** — each running turn keeps a display checkpoint. If the gateway dies mid-turn, the next start freezes that card into a finished "已中断" card (content kept, no spinner) instead of leaving it spinning forever.
+- **Command cards** — slash-command feedback gets its own card: title by command, colour by outcome (green done / red failed / blue running / orange warning).
 
 ### Why it does not break when Hermes upgrades
 
@@ -149,8 +151,10 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 - **原生表格**：Markdown 表格渲染成飞书 `table` 组件。
 - **footer**：用时、模型、输入/输出 token、上下文用量。
 - **流式正文**：边生成边更新，结束不留光标字符。
-- **交互式 clarify**：选项渲染成真按钮，点了会真的回传；超时或被取代的提问会把按钮撤下。
+- **交互式 clarify**：选项渲染成真按钮，点了会真的回传；点过的卡冻结成静态回执（只留文字、不留控件），超时或被取代的提问会把按钮撤下。
 - **回合外卡片不装忙**：启动通知、定时任务、斜杠命令的回复身后没有回合，渲染成已收尾的 notice 卡，而不是一张永远「⏳ 执行中」、计时还在涨的卡。
+- **进程挂掉也不留转圈卡**：每个进行中的回合都有展示检查点；网关中途挂掉时，下次启动会把那张卡冻结成「已中断」（正文保留、不再转圈）。
+- **命令卡**：斜杠命令的反馈用专门的卡——标题随命令、配色随结果（绿=完成 / 红=失败 / 蓝=进行中 / 橙=警告）。
 
 ### 为什么不会因为 Hermes 升级而挂
 

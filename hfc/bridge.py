@@ -12,6 +12,7 @@ HFC 原来靠源码 hook + sidecar 投递，这里的事件源是适配器自己
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -23,8 +24,16 @@ from .events import SidecarEvent
 from .render import render_card
 from .render_options import card_render_options
 from .session import CardSession
+from .session_store import SessionStore
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "1"
+
+# 卡片状态检查点：崩溃/重启后能把这它收尾，而不是留在「执行中」。
+STATE_DIR = Path(__file__).resolve().parent.parent / "state"
+CHECKPOINT_INTERVAL = 2.0   # 秒；每帧都落盘等于每帧一次磁盘写
+STALE_AFTER = 600.0         # 秒；比这更老的「执行中」检查点一定是上一个进程留下的
 
 # 每个 chat 一个 CardSession，只按 chat 累积（同一 chat 的下一回合会整条替换）。
 # 长跑网关里往来的 chat 会一直涨，所以按 LRU 保留最近这么多个，淘汰最久未用的。
@@ -80,13 +89,16 @@ def strip_cursor(text: str) -> str:
 class HfcTurnBridge:
     """一个 chat 一个 HFC CardSession；正文按累积帧换算成 delta 喂进去。"""
 
-    def __init__(self, title: str = "Hermes") -> None:
+    def __init__(self, title: str = "Hermes", *, store_dir: Optional[Path] = None) -> None:
         self.title = title
         self.config = load_card_config()
         self._sessions: dict[str, CardSession] = {}
         self._pushed: dict[str, int] = {}   # chat -> 已经喂过的累积正文长度
         self._order: OrderedDict[str, None] = OrderedDict()   # LRU：最近用过的 chat 排最后
         self._seq = 0
+        self._store_dir = Path(store_dir) if store_dir is not None else STATE_DIR
+        self._store: Optional[SessionStore] = None
+        self._checkpointed: dict[str, float] = {}   # chat -> 上次落盘的时刻
 
     def _touch(self, chat_id: str) -> None:
         """把 chat 标记为最近使用，超过 MAX_SESSIONS 时淘汰最久未用的会话状态。"""
@@ -96,6 +108,52 @@ class HfcTurnBridge:
             stale, _ = self._order.popitem(last=False)
             self._sessions.pop(stale, None)
             self._pushed.pop(stale, None)
+
+    # ── 检查点（HFC 的 session_store）────────────────────────────────────────
+    def store(self) -> SessionStore:
+        """懒建：目录只在真的要落盘时才创建，判据脚本里不碰磁盘。"""
+        if self._store is None:
+            self._store = SessionStore(self._store_dir)
+        return self._store
+
+    def checkpoint(self, chat_id: str, message_id: str) -> None:
+        """把这个回合的卡片状态落盘（限流）。没有它，进程一挂，卡就永远停在执行中。"""
+        session = self._sessions.get(chat_id)
+        if not session or not message_id or session.delivery_kind != "chat":
+            return
+        now = time.monotonic()
+        if now - self._checkpointed.get(chat_id, 0.0) < CHECKPOINT_INTERVAL:
+            return
+        try:
+            self.store().save(session.message_id, session, message_id, "", "", [], "")
+            self._checkpointed[chat_id] = now
+        except Exception as exc:   # 检查点只是兜底，不能影响投递
+            logger.warning("[feishu-card] checkpoint save failed: %s", exc)
+
+    def drop_checkpoint(self, chat_id: str) -> None:
+        """回合正常收尾：检查点已无用，删掉免得下次启动再收尾一次。"""
+        session = self._sessions.get(chat_id)
+        getattr(self, "_checkpointed", {}).pop(chat_id, None)
+        if session is None or getattr(self, "_store", None) is None:
+            return   # 没落过盘就没有要删的记录（判据脚本里 bridge 可能没初始化存储）
+        try:
+            self.store().remove(session.message_id)
+        except Exception as exc:
+            logger.warning("[feishu-card] checkpoint remove failed: %s", exc)
+
+    def stale_checkpoints(self, *, older_than: float = STALE_AFTER) -> list[dict[str, Any]]:
+        """上一个进程留下的、还停在「执行中」的卡片（进程被杀时无法收尾的那些）。"""
+        try:
+            records = self.store().load()
+        except Exception as exc:
+            logger.warning("[feishu-card] checkpoint load failed: %s", exc)
+            return []
+        cutoff = time.time() - older_than
+        # load() 已经把 session 还原成 CardSession 对象，这里按属性读，不按 dict 读。
+        return [r for r in records
+                if r.get("message_id")
+                and float(r.get("saved_at") or 0) < cutoff
+                and getattr(r.get("session"), "status", "") == "thinking"]
 
     # ── 事件 ────────────────────────────────────────────────────────────────
     def _apply(self, chat_id: str, name: str, data: dict[str, Any]) -> None:
@@ -109,7 +167,7 @@ class HfcTurnBridge:
             sequence=self._seq, created_at=time.time(), data=dict(data),
         ))
 
-    def start(self, chat_id: str, *, reply_to: str = "", delivery_kind: str = "live") -> None:
+    def start(self, chat_id: str, *, reply_to: str = "", delivery_kind: str = "chat") -> None:
         """一次入站消息 = 一个回合：新 session，时间线/正文归零。"""
         self._sessions[chat_id] = CardSession(
             conversation_id=chat_id, message_id=f"turn-{chat_id}-{int(time.time() * 1000)}", chat_id=chat_id,
@@ -126,7 +184,7 @@ class HfcTurnBridge:
         置 completed，否则 session 停在 thinking、没有 complete 事件，卡片永远「执行中」。
         """
         if chat_id not in self._sessions:
-            self.start(chat_id, delivery_kind="notice" if create_notice else "live")
+            self.start(chat_id, delivery_kind="notice" if create_notice else "chat")
             if create_notice:
                 self.complete(chat_id)
         else:
@@ -169,6 +227,7 @@ class HfcTurnBridge:
         if session is None:
             return
         # model/tokens/context 喂进去，HFC 的 footer（duration·model·tokens·context）才有数据。
+        self.drop_checkpoint(chat_id)
         self._apply(chat_id, "message.completed", {
             "answer": session.answer_text, "turn_outcome": outcome, "duration": duration,
             "tokens": tokens or {}, "model": model, "provider": provider,
@@ -185,6 +244,7 @@ class HfcTurnBridge:
         """中断/失败 → message.failed，卡片走失败态而不是永远转圈。"""
         if chat_id not in self._sessions:
             return
+        self.drop_checkpoint(chat_id)
         self._apply(chat_id, "message.failed", {
             "reason": reason, "error": reason, "turn_outcome": "failed",
         })

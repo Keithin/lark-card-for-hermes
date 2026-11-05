@@ -32,7 +32,17 @@ from typing import Any, Optional
 # HFC 的渲染/状态机原样复用（hfc/ 下是从 HFC 备份整份搬来的模块，见 hfc/bridge.py 说明）。
 try:
     from .hfc.bridge import HfcTurnBridge, load_card_config
+    from .hfc.card_limits import inspect_card_limits
     from .hfc.cardkit import CardKitTransport
+    from .hfc.command_cards import (
+        hfc_command_result_card, hfc_command_result_template, hfc_command_result_title,
+    )
+    from .hfc.existing_owner_projection import project_existing_owner
+    from .hfc.legacy_owner import static_legacy_receipt
+    from .hfc.native_commands import SAFE_QUICK_COMMANDS
+    from .hfc.owner_display_policy import OwnerRefreshState, collapsed_transfer_elements
+    from .hfc.render import CardRenderResult
+    from .hfc.text import TableOverflowResult
     from .hfc.canonical_turn import consume_canonical_turn_id, publish_canonical_turn_id
     from .hfc.client import RestClient
     from .hfc.config_rules import READING_PRESETS, normalize_reading_preset
@@ -44,7 +54,17 @@ try:
 except ImportError:  # 判据脚本按文件路径加载插件时没有包上下文
     sys.path.insert(0, str(Path(__file__).parent))
     from hfc.bridge import HfcTurnBridge, load_card_config
+    from hfc.card_limits import inspect_card_limits
     from hfc.cardkit import CardKitTransport
+    from hfc.command_cards import (
+        hfc_command_result_card, hfc_command_result_template, hfc_command_result_title,
+    )
+    from hfc.existing_owner_projection import project_existing_owner
+    from hfc.legacy_owner import static_legacy_receipt
+    from hfc.native_commands import SAFE_QUICK_COMMANDS
+    from hfc.owner_display_policy import OwnerRefreshState, collapsed_transfer_elements
+    from hfc.render import CardRenderResult
+    from hfc.text import TableOverflowResult
     from hfc.canonical_turn import consume_canonical_turn_id, publish_canonical_turn_id
     from hfc.client import RestClient
     from hfc.config_rules import READING_PRESETS, normalize_reading_preset
@@ -167,6 +187,86 @@ def _preview(tool_name: str, args: Any) -> str:
         return _redact(build_tool_preview(tool_name, args or {}, max_len=48) or "")
     except Exception:
         return ""
+
+
+# ── 命令卡（HFC command_cards / native_commands）───────────────────────────────
+# 斜杠命令的回复是「命令反馈」而不是回答：HFC 给它单独的卡（标题/配色随命令与结果）。
+# shortcut: 网关送命令回复时不带命令名，所以用「命令 handler 先登记正文」这一条确定性的边，
+# 只在插件自己注册的命令上生效；要覆盖内置命令得等上游在 send metadata 里给出命令名。
+_COMMAND_REPLY_TTL = 120.0
+_COMMAND_REPLIES: dict[str, tuple[float, str]] = {}   # 回复正文 -> (登记时刻, 命令名)
+
+
+def _mark_command_reply(command: str, text: str) -> None:
+    """命令 handler 返回前登记回复正文，send() 据此把它渲染成命令卡。"""
+    body = (text or "").strip()
+    if not body:
+        return
+    now = time.monotonic()
+    for stale, (ts, _name) in list(_COMMAND_REPLIES.items()):
+        if now - ts > _COMMAND_REPLY_TTL:
+            _COMMAND_REPLIES.pop(stale, None)
+    _COMMAND_REPLIES[body] = (now, str(command or "").strip().lower())
+
+
+def _command_card(text: str) -> Optional[dict]:
+    """命令回复 -> 命令卡；不是命令回复就返回 None（正常卡路径接管）。"""
+    hit = _COMMAND_REPLIES.get((text or "").strip())
+    if hit is None:
+        return None
+    ts, command = hit
+    if time.monotonic() - ts > _COMMAND_REPLY_TTL:
+        return None
+    if command and command not in SAFE_QUICK_COMMANDS and command != "card-preset":
+        return None
+    body = (text or "").strip()
+    return hfc_command_result_card(
+        title=hfc_command_result_title(command),
+        content=body,
+        template=hfc_command_result_template(body),
+    )
+
+
+# ── 崩溃遗留卡的收尾（HFC session_store + existing_owner_projection）────────────
+def _stale_card(record: dict) -> Optional[dict]:
+    """上一个进程留下的「执行中」检查点 → 冻结成收尾卡（schema 2.0，原地更新同一张卡）。
+
+    旧正文保留（`project_existing_owner` 的 legacy 投影），并折叠进「此前内容」面板，
+    不留按钮/流式，也不再显示执行态。
+    """
+    text = str(getattr(record.get("session"), "answer_text", "") or "").strip()
+    title = str((_TURNS.config or {}).get("title") or CARD_TITLE)
+    elements = [{"tag": "markdown", "element_id": "main_content", "content": text or " "}]
+    folded = collapsed_transfer_elements(elements)
+    if folded is not None:
+        elements = folded
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown",
+                     "content": "⚠️ 上一个进程在执行中退出，本卡已停止更新。"})
+    source = {"schema": "2.0", "header": {"template": "grey",
+                                          "title": {"tag": "plain_text", "content": title}},
+              "body": {"elements": elements}}
+    receipt = static_legacy_receipt(source)
+    try:
+        result = CardRenderResult(
+            card=source, disposition="card", inspection=inspect_card_limits(receipt),
+            table_overflow=TableOverflowResult(text=text, source_table_count=0), primary_text=text,
+        )
+        kept = project_existing_owner(result, receipt=receipt, terminal=True,
+                                      live_card=lambda: None, title=lambda: title).card
+    except Exception:   # 投影失败也要收尾：退回冻结回执
+        kept = receipt
+    kept_elements = kept.get("elements") if isinstance(kept, dict) else None
+    if not kept_elements:   # 投影返回的是 v2 卡体
+        kept_elements = (kept or {}).get("body", {}).get("elements") or elements
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "summary": {"content": title}},
+        "header": {"template": "grey",
+                   "title": {"tag": "plain_text", "content": f"{title} · 已中断"},
+                   "subtitle": {"tag": "plain_text", "content": "上一进程退出，本卡已停止更新"}},
+        "body": {"elements": kept_elements},
+    }
 
 
 def _append(row: dict) -> None:
@@ -397,6 +497,7 @@ def _build_adapter_class(base: Any) -> type:
             self._dead_remap: dict[str, str] = {}      # 坏卡 message_id -> 顶替它的新消息
             self._cardkit: Optional[CardKitTransport] = None
             self._clarify_state: dict[str, dict[str, str]] = {}   # clarify_id -> 卡片位置
+            self._clarify_cards: dict[str, dict[str, Any]] = {}   # clarify_id -> 发出去的那张卡（冻结回执用）
 
         # ── clarify 按钮卡 ──────────────────────────────────────────────────────
         # 照内置审批卡的线程模型（同步回调 + _submit_on_loop + _card_response）和 _validate_card_action
@@ -418,13 +519,15 @@ def _build_adapter_class(base: Any) -> type:
             """有选项时发按钮卡；无选项（开放式提问）沿用内置的文字拦截。"""
             if not choices:
                 return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+            card = self._clarify_card(question, choices, clarify_id)
             try:
                 result = await self._send_interactive_card(
-                    chat_id, self._clarify_card(question, choices, clarify_id), metadata,
+                    chat_id, card, metadata,
                     "send clarify card failed", state_map=self._clarify_state,
                     state_id=clarify_id, session_key=session_key,
                 )
                 if result.success:
+                    self._clarify_cards[clarify_id] = card
                     return result
             except Exception as exc:  # 卡片是外观，提问必须送达
                 logger.warning("[feishu-card] clarify card failed, using text: %s", exc)
@@ -469,7 +572,28 @@ def _build_adapter_class(base: Any) -> type:
                     clarify_id=clarify_id, choice=choice, chat_id=state.get("chat_id", ""))):
                 return self._card_response()
             label = f"其他…（请直接回复）" if not choice else str(choice)
-            return self._card_response(base._card(CARD_TITLE, "grey", f"已选择：{label}"))
+            return self._card_response(self._clarify_receipt(clarify_id, label, state))
+
+        def _clarify_receipt(self, clarify_id: str, label: str, state: dict) -> dict:
+            """点完的按钮卡冻结成静态回执：只留文字、不留控件。
+
+            `OwnerRefreshState.card_source` 判的是「回执是否该落在另一张消息上」：clarify 卡与
+            回合卡是两条消息，所以这里是 separate_receipt —— 回执写回 clarify 卡本身。
+            """
+            clarify_mid = str(state.get("message_id") or "")
+            policy = OwnerRefreshState(
+                event_kind="interaction.completed", is_terminal=True,
+                owner_message_id=str(self._turn_card_id(state.get("chat_id", "")) or ""),
+                interaction_present=True, interaction_status="completed",
+                interaction_message_id=clarify_mid,
+                has_receipt_fingerprint=False, has_legacy_owner_receipt=False,
+            )
+            policy.card_source(lambda: "text")   # 记录本机策略判定；clarify 卡恒为独立回执
+            source = self._clarify_cards.pop(clarify_id, None) or {}
+            elements = [e for e in source.get("elements", []) if e.get("tag") in {"markdown", "hr"}]
+            elements.append({"tag": "hr"})
+            elements.append({"tag": "markdown", "content": f"**已选择：** {label}"})
+            return static_legacy_receipt({**source, "elements": elements})
 
         async def _resolve_clarify(self, *, clarify_id: str, choice: Any, chat_id: str) -> None:
             from tools.clarify_gateway import mark_awaiting_text, resolve_gateway_clarify
@@ -497,7 +621,27 @@ def _build_adapter_class(base: Any) -> type:
             ok = await super().connect(is_reconnect=is_reconnect)
             if ok and _install_card_frame_repair():
                 logger.info("[feishu-card] 已修复 lark-oapi 的 CARD 帧丢弃（卡片按钮回调可达）")
+            if ok:
+                await self._close_stale_cards()
             return ok
+
+        async def _close_stale_cards(self) -> None:
+            """上个进程被杀时留下的「执行中」卡：原地冻结成收尾卡，不留永久转圈。"""
+            try:
+                records = _TURNS.stale_checkpoints()
+            except Exception as exc:
+                logger.warning("[feishu-card] stale checkpoint scan failed: %s", exc)
+                return
+            for record in records:
+                card = _stale_card(record)
+                if not card:
+                    continue
+                try:
+                    if self._cardkit is not None and await self._cardkit.update(record["message_id"], card):
+                        _TURNS.store().remove(record["key"])
+                        logger.info("[feishu-card] closed stale card %s", record["message_id"])
+                except Exception as exc:
+                    logger.warning("[feishu-card] closing stale card failed: %s", exc)
 
         def _transport(self) -> CardKitTransport:
             """HFC 的 CardKitTransport + 最小 REST 通道；凭据在 connect 后才就绪，故延迟构造。"""
@@ -591,6 +735,22 @@ def _build_adapter_class(base: Any) -> type:
             is_progress = MERGE_TOOL_CARD and looks_like_progress(formatted, self._tool_lines)
             logger.info("[feishu-card] send chat=%s len=%d progress=%s known=%d",
                         chat_id, len(formatted), is_progress, len(self._tool_lines))
+            # 斜杠命令的反馈不是回答：用 HFC 的命令卡（标题/配色随命令与结果）。
+            command_card = None if is_progress else _command_card(formatted)
+            if command_card is not None:
+                try:
+                    response = await self._feishu_send_with_retry(
+                        chat_id=chat_id, msg_type="interactive",
+                        payload=json.dumps(command_card, ensure_ascii=False),
+                        reply_to=reply_to, metadata=metadata,
+                    )
+                    result = self._finalize_send_result(response, "command card send failed")
+                    if result.success:
+                        return result
+                    logger.warning("[feishu-card] command card rejected, using normal path: %s",
+                                   result.error)
+                except Exception as exc:
+                    logger.warning("[feishu-card] command card failed, using normal path: %s", exc)
             # 回合已收尾（final）就不能再合并：否则回合外的同 chat 消息（定时任务/通知）
             # 会被当成本回合第二次 send，直接改写上一条答复卡。
             if MERGE_TOOL_CARD and _TURN["chat"] == chat_id and not _TURN["final"]:
@@ -609,6 +769,7 @@ def _build_adapter_class(base: Any) -> type:
             result = await self._send_card(chat_id, "" if is_progress else formatted, content, reply_to, metadata)
             if result is not None and getattr(result, "message_id", ""):
                 self._remember_turn_card(chat_id, result.message_id)
+                _TURNS.checkpoint(chat_id, result.message_id)
             return result
 
         async def _send_card(self, chat_id: str, main: str, content: str, reply_to, metadata):
@@ -669,6 +830,7 @@ def _build_adapter_class(base: Any) -> type:
                     if await self._cardkit.update(
                         message_id, self._card_v2(chat_id, text, streaming=not finalize)
                     ):
+                        _TURNS.checkpoint(chat_id, message_id)
                         return SendResult(success=True, message_id=message_id)
                 except Exception as exc:
                     # 卡片更新失败不能让正文丢掉：交回内置编辑/发送路径
@@ -825,7 +987,9 @@ def _on_card_preset(raw_args: str) -> str:
     if not arg:
         picked = ask_choice("切换卡片阅读预设", _PRESET_CHOICES)
         if not picked:
-            return _preset_usage()
+            usage = _preset_usage()
+            _mark_command_reply("card-preset", usage)
+            return usage
         arg = picked
     try:
         name = _write_preset(arg)
@@ -835,7 +999,9 @@ def _on_card_preset(raw_args: str) -> str:
         return f"写入 config.json 失败：{exc}"
     with _TURNS_LOCK:
         _TURNS.config = load_card_config()
-    return f"✅ 卡片预设已切换到 {name}（已写入 config.json，下一条消息生效，无需重启）"
+    reply = f"✅ 卡片预设已切换到 {name}（已写入 config.json，下一条消息生效，无需重启）"
+    _mark_command_reply("card-preset", reply)
+    return reply
 
 
 def register(ctx: Any) -> None:
