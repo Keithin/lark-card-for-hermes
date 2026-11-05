@@ -23,6 +23,7 @@ This is a Hermes **platform plugin**. It overrides only the Feishu adapter's out
 - **Footer** — duration, model, input/output tokens, context usage.
 - **Streaming body** — updates as it generates, no leftover cursor glyph when it finishes.
 - **Interactive clarify** — `clarify` options render as real buttons that send the answer back; expired or superseded prompts have their buttons withdrawn.
+- **Honest out-of-turn cards** — startup/cron notifications and slash-command replies have no turn behind them, so they render as a notice card marked done instead of a card stuck on `⏳ running` with a growing clock.
 
 ### Why it does not break when Hermes upgrades
 
@@ -49,7 +50,7 @@ Even if upstream changes a private function we depend on, the failure mode is **
 ### Install
 
 ```bash
-git clone https://github.com/Keithin/lark-card-for-hermes.git ~/.hermes/plugins/feishu-card
+git clone https://github.com/Keithin/lark-card-for-hermes.git ~/.hermes/plugins/lark-card-for-hermes
 ```
 
 Then restart the gateway **from a separate shell** (you cannot restart it from inside the gateway process):
@@ -110,7 +111,7 @@ Listed chats get native Feishu text; everything else keeps cards. An empty array
 
 ```
 __init__.py          # plugin entry: adapter overrides + 10 hooks + clarify button cards
-plugin.yaml          # manifest (internal ID stays feishu-card)
+plugin.yaml          # manifest (plugin ID = catalog key = lark-card-for-hermes)
 hfc/                 # HFC rendering stack (MIT), used as-is
   bridge.py          #   ← new here: event translation layer
   client.py          #   ← new here: minimal REST channel
@@ -149,6 +150,7 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 - **footer**：用时、模型、输入/输出 token、上下文用量。
 - **流式正文**：边生成边更新，结束不留光标字符。
 - **交互式 clarify**：选项渲染成真按钮，点了会真的回传；超时或被取代的提问会把按钮撤下。
+- **回合外卡片不装忙**：启动通知、定时任务、斜杠命令的回复身后没有回合，渲染成已收尾的 notice 卡，而不是一张永远「⏳ 执行中」、计时还在涨的卡。
 
 ### 为什么不会因为 Hermes 升级而挂
 
@@ -175,7 +177,7 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 ### 安装
 
 ```bash
-git clone https://github.com/Keithin/lark-card-for-hermes.git ~/.hermes/plugins/feishu-card
+git clone https://github.com/Keithin/lark-card-for-hermes.git ~/.hermes/plugins/lark-card-for-hermes
 ```
 
 然后在**独立 shell** 里重启网关（不能在网关进程内部重启）：
@@ -236,7 +238,7 @@ hermes gateway restart
 
 ```
 __init__.py          # 插件入口：adapter 覆写 + 10 个 hook + clarify 按钮卡
-plugin.yaml          # 插件清单（内部 ID 保持 feishu-card）
+plugin.yaml          # 插件清单（插件 ID = catalog key = lark-card-for-hermes）
 hfc/                 # HFC 渲染栈（MIT），原样复用
   bridge.py          #   ← 本项目新增：事件翻译层
   client.py          #   ← 本项目新增：最小 REST 通道
