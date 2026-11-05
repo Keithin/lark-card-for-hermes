@@ -188,6 +188,11 @@ def _header_for_v1(chat_id: str) -> tuple[str, str]:
     return _card_title(), "blue"
 
 
+def _outcome_unknown(exc: BaseException) -> bool:
+    """投递结果未知（可能已经发出去）：这时候回落=再发一条，会变成两张卡。"""
+    return str(getattr(exc, "outcome", "") or "").strip().lower() == "unknown"
+
+
 def _redact(text: str) -> str:
     """Hermes 自己的敏感信息脱敏（force：展示给聊天必须脱，不看 security.redact_secrets）。"""
     try:
@@ -801,6 +806,12 @@ def _build_adapter_class(base: Any) -> type:
                     try:
                         return await self._send_streaming_card(chat_id, main, reply_to, metadata)
                     except Exception as exc:
+                        # 回落只对「确定没发出去」的失败生效。结果未知时再发一条 v1 卡 =
+                        # 同一回合两张卡，比丢一次更新更糟；把它抛回网关的投递层。
+                        if _outcome_unknown(exc):
+                            logger.error("[feishu-card] cardkit send outcome unknown, "
+                                         "not falling back (would duplicate the card): %s", exc)
+                            raise
                         logger.warning("[feishu-card] cardkit send failed, using v1 card: %s", exc)
                 try:
                     result = await self._send_v1_card(chat_id, main, reply_to, metadata)
