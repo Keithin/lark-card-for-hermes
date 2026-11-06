@@ -33,12 +33,45 @@ TESTED_HERMES = ">=0.22.7,<0.23"
 _BASE_PACKAGE = "hermes_feishu_bundled"
 
 
+def _bundled_feishu_root() -> Path:
+    """定位内置 feishu 插件目录；多源兜底，降低 Hermes 内部包布局变动的风险。"""
+    candidates: list[Path] = []
+
+    # 1. 优先用运行时代码树（gateway 在哪，插件树就在哪）
+    for mod_name in ("gateway", "hermes_cli", "hermes_agent"):
+        try:
+            mod = importlib.import_module(mod_name)
+            file = getattr(mod, "__file__", None)
+            if file:
+                base = Path(file).resolve().parent
+                # gateway/ 和 hermes_cli/ 平级；hermes_agent/ 可能在根下
+                roots = [base.parent, base] if mod_name == "hermes_agent" else [base.parent]
+                for root in roots:
+                    candidates.append(root / "plugins" / "platforms" / "feishu")
+        except Exception:
+            continue
+
+    # 2. 从 Hermes home 推断（稳定兜底）
+    try:
+        from hermes_constants import get_hermes_home
+        candidates.append(get_hermes_home() / "hermes-agent" / "plugins" / "platforms" / "feishu")
+    except Exception:
+        pass
+
+    for root in candidates:
+        init = root / "__init__.py"
+        if init.exists():
+            return root
+
+    raise ImportError(
+        f"cannot locate bundled feishu plugin; tried: {', '.join(str(r) for r in candidates)}"
+    )
+
+
 def adapter_module() -> Any:
     """导入内置 feishu 插件（私有包名下，避免与网关自己的模块冲突）。"""
     if _BASE_PACKAGE not in sys.modules:
-        import gateway  # 拥有 gateway/ 的那棵树也是插件树
-
-        root = Path(gateway.__file__).resolve().parent.parent / "plugins" / "platforms" / "feishu"
+        root = _bundled_feishu_root()
         spec = importlib.util.spec_from_file_location(
             _BASE_PACKAGE, root / "__init__.py", submodule_search_locations=[str(root)],
         )

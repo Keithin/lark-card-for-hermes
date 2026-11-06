@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib
-import importlib.util
 import json
 import logging
 import sys
@@ -79,7 +77,6 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
 
 logger = logging.getLogger(__name__)
 
-_BASE_PACKAGE = "hermes_feishu_bundled"
 CARD_TITLE = "Hermes"
 ELEMENT_ID = "main"
 TIMELINE_ID = "timeline"
@@ -494,18 +491,16 @@ def _bundled_feishu():
 
     The bundled plugin's own relative imports resolve inside this synthetic package, so this
     never collides with the gateway's own ``hermes_plugins.platforms__feishu`` module.
-    """
-    if _BASE_PACKAGE not in sys.modules:
-        import gateway  # the tree that owns gateway/ is also the plugin tree
 
-        root = Path(gateway.__file__).resolve().parent.parent / "plugins" / "platforms" / "feishu"
-        spec = importlib.util.spec_from_file_location(
-            _BASE_PACKAGE, root / "__init__.py", submodule_search_locations=[str(root)],
-        )
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[_BASE_PACKAGE] = module
-        spec.loader.exec_module(module)
-    return importlib.import_module(_BASE_PACKAGE + ".adapter")
+    shortcut: still uses the same private code tree, but discovery now has multiple
+    fallbacks (gateway, hermes_cli, hermes_agent, hermes_home) so internal renames are less
+    likely to silently break cards. Upgrade if upstream ever exposes the bundled adapter.
+    """
+    try:
+        from compat.platform import adapter_module
+    except ImportError:
+        from .compat.platform import adapter_module
+    return adapter_module()
 
 
 def _sdk_models() -> dict[str, Any]:
@@ -1061,10 +1056,14 @@ def _on_card_preset(raw_args: str) -> str:
     （命令本身的注册仍需一次重启才出现）。handler 必须自己接住所有异常：抛出去会被
     派发层当成「未处理」，把命令文本转给 agent。
     """
-    from hermes_cli.plugin_choices import ask_choice
     arg = (raw_args or "").strip()
     if not arg:
-        picked = ask_choice("切换卡片阅读预设", _PRESET_CHOICES)
+        picked = None
+        try:
+            from hermes_cli.plugin_choices import ask_choice
+            picked = ask_choice("切换卡片阅读预设", _PRESET_CHOICES)
+        except Exception:
+            logger.debug("[feishu-card] ask_choice unavailable; falling back to usage text", exc_info=True)
         if not picked:
             usage = _preset_usage()
             _mark_command_reply("card-preset", usage)
