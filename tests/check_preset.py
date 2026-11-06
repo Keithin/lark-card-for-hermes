@@ -153,6 +153,9 @@ class _FakeCtx:
     def register_command(self, name, handler, **kw):
         self.commands[name] = (handler, kw)
 
+    def register_platform(self, **kw):        # 1.7.4 起注册期总会走公开注册（录音路径）
+        return object()
+
 
 orig_bundled, orig_build = mod._bundled_feishu, mod._build_adapter_class
 mod._bundled_feishu = lambda: types.SimpleNamespace(

@@ -1,38 +1,26 @@
 #!/usr/bin/env python3
-"""判据：注册走公开的 ``ctx.register_platform``，且沿用内置条目的准入/配对字段。
+"""判据：注册走公开的 ``ctx.register_platform``，字段与内置插件的声明逐项一致。
 
 1. 不重绑内置模块的 ``FeishuAdapter`` 全局（旧做法会污染同进程的其他使用者）；
-2. ``register_platform`` 收到的 name/label/required_env/allowed_users_env/allow_all_env
-   与内置 feishu 条目一致，只换 adapter_factory；
-3. factory 造出来的是本插件的子类，而不是内置类本身；
-4. 内置条目不可用时**放弃注册**并降级（不猜条目、不改变准入）。
+2. 加载路径**绝不读 platform_registry**——feishu 是 deferred 条目，`get()` 会跑它的
+   deferred loader，loader 要拿 discovery 锁，而锁被父线程的 deadline join 持有 →
+   必死等到 10s 超时、注册全被拒（2026-11-06 网关实测的回归）；
+3. 传给 ctx.register_platform 的 kwargs == 内置插件自己 register() 声明的 kwargs，
+   只换 adapter_factory；准入字段（allowed_users_env / allow_all_env /
+   allowlist_suppresses_pairing）逐项等于上游源码里的值；永不带 trusted_inbound；
+4. 录音失败时**放弃注册**并降级（不猜字段、不改准入），hooks 照常注册。
 """
 from pathlib import Path
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 import importlib.util
 import sys
-from dataclasses import dataclass, field
 
 HERMES = Path.home() / ".hermes/hermes-agent"   # 只读源码树：插件与网关的 import 根
 sys.path.insert(0, str(HERMES))
 sys.path.insert(0, REPO_ROOT)                   # compat/ 是插件自己的包
 
-
-@dataclass
-class _Entry:
-    name: str = "feishu"
-    label: str = "Feishu / Lark"
-    adapter_factory: object = None
-    check_fn: object = lambda: True
-    required_env: list = field(default_factory=lambda: ["FEISHU_APP_ID", "FEISHU_APP_SECRET"])
-    allowed_users_env: str = "FEISHU_ALLOWED_USERS"
-    allow_all_env: str = "FEISHU_ALLOW_ALL"
-    install_hint: str = "hint"
-    max_message_length: int = 8000
-    source: str = "builtin"
-    plugin_name: str = ""
-    trusted_inbound: bool = False
+from compat import platform as _compat_first      # register() 内部走同一顶层导入 → 同一实例
 
 
 class _Ctx:
@@ -61,59 +49,79 @@ def _load_plugin():
     return mod
 
 
+def _compat_modules():
+    """插件可能把 compat 解析成 ``compat.platform`` 或 ``lcf_reg.compat.platform``。"""
+    return [m for k, m in list(sys.modules.items())
+            if k == "compat.platform" or k.endswith(".compat.platform")]
+
+
 def main() -> None:
     mod = _load_plugin()
 
     # 内置适配器模块：记录注册前后它的 FeishuAdapter 是否被改写
     base = mod._bundled_feishu()
     original = base.FeishuAdapter
+    compat = _compat_first
+    assert compat in _compat_modules(), "test and plugin must share one compat instance"
 
-    entry = _Entry()
-    mod_registry = sys.modules["lcf_reg"]
-    # 插件可能把 compat 解析成 ``compat.platform`` 或 ``<模块名>.compat.platform``：
-    # 两个都是同一份代码的不同实例，测试把找到的都打上桩。
-    compat_mods = [m for k, m in list(sys.modules.items())
-                   if k == "compat.platform" or k.endswith(".compat.platform")]
-    if not compat_mods:      # register() 内部才 import：先跑一遍让它加载
-        mod_registry.register(_Ctx())
-        compat_mods = [m for k, m in list(sys.modules.items())
-                       if k == "compat.platform" or k.endswith(".compat.platform")]
-    assert compat_mods, "plugin did not import its compat layer"
-    compat = compat_mods[0]
+    # 上游的参考声明：内置插件自己 register() 录出来的 kwargs
+    ref = compat._RegistrationRecorder()
+    base.register(ref)
+    upstream = [k for k in ref.platforms if k.get("name") == "feishu"]
+    assert len(upstream) == 1, f"bundled feishu must declare exactly one platform, got {len(upstream)}"
+    upstream = upstream[0]
 
-    for compat_mod in compat_mods:
-        compat_mod.registered_entry = lambda name="feishu": entry  # 假的内置条目
-    ctx = _Ctx()
-    mod_registry.register(ctx)
+    # 回归闸：加载期间谁都不许读注册表（读 = 触发 deferred loader = 死锁到 10s 超时）
+    from gateway.platform_registry import platform_registry
+    orig_get = platform_registry.get
+
+    def _registry_boom(*_args, **_kwargs):
+        raise AssertionError("platform_registry.get() during plugin load — deferred-loader deadlock")
+
+    platform_registry.get = _registry_boom
+    try:
+        ctx = _Ctx()
+        mod.register(ctx)
+    finally:
+        platform_registry.__dict__.pop("get", None)   # 还原成类方法，不留实例属性
 
     assert base.FeishuAdapter is original, "bundled FeishuAdapter must not be rebound"
     assert len(ctx.platforms) == 1, ctx.platforms
     call = ctx.platforms[0]
-    assert call["name"] == "feishu" and call["label"] == "Feishu / Lark"
+
+    # 逐项等于上游声明，只换 adapter_factory
+    assert set(call) == set(upstream), (sorted(set(call) ^ set(upstream)))
+    for key in upstream:
+        if key == "adapter_factory":
+            continue
+        assert call[key] == upstream[key], f"field drift on {key!r}: {call[key]!r} != {upstream[key]!r}"
     assert call.get("trusted_inbound") in (None, False), "must never waive admission/allowlists"
-    assert call["required_env"] == entry.required_env
-    assert call["allowed_users_env"] == entry.allowed_users_env
-    assert call["allow_all_env"] == entry.allow_all_env
-    assert call["max_message_length"] == entry.max_message_length
+    # 准入字段的具名核对（不依赖 dict 对比的盲区）
+    assert call["allowed_users_env"] == "FEISHU_ALLOWED_USERS"
+    assert call["allow_all_env"] == "FEISHU_ALLOW_ALL_USERS"
+    assert call["allowlist_suppresses_pairing"] is True
+    assert call["required_env"] == ["FEISHU_APP_ID", "FEISHU_APP_SECRET"]
     assert callable(call["adapter_factory"]) and callable(call["check_fn"])
     assert call["adapter_factory"].__name__ == "build_lark_card_adapter"
+    assert call["name"] == "feishu" and call["label"] == "Feishu / Lark"
 
-    # factory 造出来的是子类（用假 config 走构造，不联网）
+    # factory 造出来的是子类（不联网）
     cls = mod._build_adapter_class(base)
     assert issubclass(cls, original)
     assert cls is not original
     assert set(ctx.hooks) >= {"post_gateway_admission", "pre_tool_call", "on_session_end"}
     assert "card-preset" in ctx.commands
 
-    # 内置条目缺失：放弃注册，但仍注册 hooks（原生文本兜底）
-    for compat_mod in compat_mods:
-        compat_mod.registered_entry = lambda name="feishu": None
+    # 录音失败：放弃平台注册，但仍注册 hooks（原生文本兜底）
+    for compat_mod in _compat_modules():
+        compat_mod.recorded_platform_kwargs = lambda: None
     ctx2 = _Ctx()
-    mod_registry.register(ctx2)
+    mod.register(ctx2)
     assert ctx2.platforms == [], "must not invent a platform entry"
     assert ctx2.hooks, "hooks still register so nothing else breaks"
 
-    print("OK registration: ctx.register_platform(feishu) + 条目字段原样继承，不重绑内置类")
+    print("OK registration: 公开 ctx.register_platform(feishu)、字段=上游声明原样（仅换 factory）、"
+          "加载期零注册表读取、不重绑内置类")
 
 
 if __name__ == "__main__":

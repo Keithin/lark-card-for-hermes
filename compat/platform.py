@@ -1,9 +1,16 @@
 """内置 Feishu 平台条目与适配器类：插件唯一的私有依赖面。
 
 为什么还要依赖内置适配器：卡片能力是「替换出站的两个原语（send / edit_message）」，而
-配对、允许名单、准入、环境变量桥、dashboard、setup 这些规则都在内置平台条目里。本插件
-**复制该条目的全部字段**，只把 `adapter_factory` 换成本插件的子类，因此这些规则保持原样
-（不新增 trusted_inbound，不改准入）。
+配对、允许名单、准入、环境变量桥、dashboard、setup 这些规则都声明在内置插件自己的
+`register()` 里。本插件**按文件直接加载内置插件、把它 register() 声明的条目 kwargs 原样录下**，
+只把 `adapter_factory` 换成本插件的子类，因此这些规则与上游逐字段一致（不新增
+trusted_inbound，不改准入）。
+
+为什么不用 `platform_registry.get("feishu")` 读已注册条目：feishu 是 **deferred** 条目，
+`get()` 会替我们跑它的 deferred loader，而 loader 要拿 discovery 锁——本插件自己的加载
+deadline 期间，这把锁正被父线程的 `worker.join()` 持有 → 必然死等到 10s 超时、全部注册
+被拒（2026-11-06 网关实测）。读已注册条目只允许在加载完成之后（见 `registered_entry`
+仅供诊断）。
 
 支持范围：行为测试跑在 `TESTED_HERMES` 上；超范围不保证，但失效形态是「卡片降级为原生
 文本」，消息照常送达。
@@ -24,9 +31,6 @@ logger = logging.getLogger(__name__)
 TESTED_HERMES = ">=0.22.7,<0.23"
 
 _BASE_PACKAGE = "hermes_feishu_bundled"
-# 这些字段由注册方自己决定（name/label 是条目身份，factory/check 由本插件提供，
-# source/plugin_name 由 plugin 上下文写入），不复制。
-_NOT_COPIED = {"name", "label", "adapter_factory", "check_fn", "source", "plugin_name"}
 
 
 def adapter_module() -> Any:
@@ -62,22 +66,51 @@ def registered_entry(name: str = "feishu") -> Optional[Any]:
     return entry
 
 
-def entry_kwargs(entry: Any) -> dict[str, Any]:
-    """把条目字段翻成 ``ctx.register_platform`` 的 kwargs（原样复制，只换 factory）。"""
-    from dataclasses import MISSING, fields
+class _RegistrationRecorder:
+    """录下内置插件 register() 声明的平台 kwargs；其他 register_* 调用一律吞掉不外传。
 
-    from gateway.platform_registry import PlatformEntry
+    内置插件的 register() 是**纯声明**（组装 kwargs → 调一次 ctx.register_platform），
+    对它录音即可拿到与上游完全一致的字段集，且全程不碰注册表/发现锁。
+    """
 
-    kwargs: dict[str, Any] = {}
-    for field in fields(PlatformEntry):
-        if field.name in _NOT_COPIED:
-            continue
-        if hasattr(entry, field.name):
-            kwargs[field.name] = getattr(entry, field.name)
-        elif field.default is not MISSING:      # 老/新条目缺字段：用数据类默认值
-            kwargs[field.name] = field.default
-        elif field.default_factory is not MISSING:
-            kwargs[field.name] = field.default_factory()
+    __slots__ = ("platforms",)
+
+    def __init__(self) -> None:
+        self.platforms: list[dict[str, Any]] = []
+
+    def register_platform(self, *args: Any, **kwargs: Any) -> None:
+        # 上游签名：register_platform(name, label, adapter_factory, check_fn, …)——
+        # 目前内置 feishu 全用关键字；位置参数只兜前四个。
+        if args:
+            kwargs = {**dict(zip(("name", "label", "adapter_factory", "check_fn"), args)),
+                      **kwargs}
+        self.platforms.append(kwargs)
+
+    def __getattr__(self, _name: str):   # register_hook/register_command/…：空操作
+        def _noop(*_args: Any, **_kwargs: Any) -> None:
+            return None
+        return _noop
+
+
+def recorded_platform_kwargs() -> Optional[dict[str, Any]]:
+    """加载路径唯一入口：按文件加载内置插件并录下它的条目 kwargs（零锁、零注册表）。
+
+    返回 None = 内置插件缺失/声明变了：调用方必须放弃注册并降级为原文本，不猜造字段。
+    """
+    try:
+        adapter = adapter_module()
+        recorder = _RegistrationRecorder()
+        adapter.register(recorder)
+    except Exception as exc:
+        logger.warning("[lark-card] bundled feishu registration could not be recorded: %s", exc)
+        return None
+    matches = [k for k in recorder.platforms if k.get("name") == "feishu"]
+    if len(matches) != 1:
+        logger.warning("[lark-card] expected exactly one feishu platform declaration, got %d",
+                       len(matches))
+        return None
+    kwargs = dict(matches[0])
+    kwargs.pop("trusted_inbound", None)   # 永不豁免准入（公开 API 对 user 插件也会拒）
     return kwargs
 
 

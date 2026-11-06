@@ -1108,17 +1108,16 @@ def register(ctx: Any) -> None:
     except ImportError:
         from .compat import platform as compat
 
-    entry = compat.registered_entry("feishu")
-    if entry is None:
-        logger.error("[lark-card] bundled feishu platform entry not found; "
+    # 不要读 platform_registry：feishu 是 deferred 条目，get() 会跑它的 deferred loader，
+    # loader 要拿 discovery 锁，而这把锁正被父线程对本插件 load 的 deadline join 持有 →
+    # 必死等到 10s 超时、注册全被拒（2026-11-06 实测）。改为录音内置插件自己的声明（零锁）。
+    recorded = compat.recorded_platform_kwargs()
+    if recorded is None:
+        logger.error("[lark-card] bundled feishu registration could not be recorded; "
                      "cards are disabled and messages use the native text path")
     else:
-        base = _bundled_feishu()
-        handle = ctx.register_platform(
-            name=entry.name, label=entry.label,
-            adapter_factory=_adapter_factory(base), check_fn=entry.check_fn,
-            **compat.entry_kwargs(entry),
-        )
+        recorded["adapter_factory"] = _adapter_factory(_bundled_feishu())
+        handle = ctx.register_platform(**recorded)
         if handle is None:
             logger.error("[lark-card] register_platform(feishu) was refused; cards disabled")
     for hook_name, callback in _HOOKS:
