@@ -38,7 +38,8 @@ This project does the opposite:
 | Modifies Hermes source | Yes | **No** |
 | Whole-file byte verification | Yes (breaks on upgrade) | No |
 | Event source | Injected hooks | Official plugin hooks (10 of them, all in `VALID_HOOKS`) |
-| Surface area | Many private symbols | 7 imports + 3 adapter private functions |
+| Surface area | Many private symbols | Public `ctx.register_platform`; private seams confined to `compat/` (see `hermes plugins validate` output) |
+| Current-turn state | Process-wide globals | Explicit per-turn registry (`turn_state.py`): platform + session_key + chat/thread, keyed by public `turn_id` |
 
 The rendering logic reuses HFC's rendering stack (MIT, see `hfc/`). That code was **byte-identical** across HFC 5.0.9 → 5.0.13 — upstream's maintenance cost all goes into the source-adaptation layer, which this project does not need.
 
@@ -112,15 +113,18 @@ Listed chats get native Feishu text; everything else keeps cards. An empty array
 ### Layout
 
 ```
-__init__.py          # plugin entry: adapter overrides + 10 hooks + clarify button cards
+__init__.py          # plugin entry: public ctx.register_platform + 10 hooks + clarify button cards
 plugin.yaml          # manifest (plugin ID = catalog key = lark-card-for-hermes)
+turn_state.py        # explicit per-turn registry (replaces process-wide current-turn globals)
+compat/              # thin layer over the bundled adapter's registry entry (tested support range)
+tests/               # 10 behavior checks (isolated HERMES_HOME), run_all.py runs them all
 hfc/                 # HFC rendering stack (MIT), used as-is
   bridge.py          #   ← new here: event translation layer
   client.py          #   ← new here: minimal REST channel
   render.py session.py cardkit.py card_timeline.py native_tables.py ...
 ```
 
-The rendering and state-machine code under `hfc/` comes from [Hermes Feishu Streaming Card](https://github.com/baileyh8/hermes-feishu-streaming-card) (MIT). The only code added by this project is the wiring layer (`bridge.py` / `client.py`) and the adapter overrides (`__init__.py`).
+The rendering and state-machine code under `hfc/` comes from [Hermes Feishu Streaming Card](https://github.com/baileyh8/hermes-feishu-streaming-card) (MIT). The code added by this project is the wiring layer (`bridge.py` / `client.py`), the turn registry (`turn_state.py`), the thin registry-compat layer (`compat/`), the entry point (`__init__.py`) and the behavior checks (`tests/`).
 
 ### Known limitations
 
@@ -167,7 +171,8 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 | 改动 Hermes 源码 | 是 | **否** |
 | 整文件字节校验 | 是（升级即失效） | 否 |
 | 事件来源 | 注入 hook | 官方插件 hook（`VALID_HOOKS` 内的 10 个） |
-| 接口面 | 大量私有符号 | 7 个 import + 3 个 adapter 私有函数 |
+| 接口面 | 大量私有符号 | 公开 `ctx.register_platform`；私有接缝集中在 `compat/`（清单见 `hermes plugins validate`） |
+| 当前回合状态 | 进程级全局变量 | 显式每回合注册表（`turn_state.py`）：platform + session_key + chat/thread，以公开 `turn_id` 标识 |
 
 渲染逻辑直接复用 HFC 的渲染栈（MIT，见 `hfc/`）。那部分代码在 5.0.9 → 5.0.13 之间**逐字节未变**——上游的维护成本全花在源码适配层，而本项目不需要那一层。
 
@@ -241,15 +246,18 @@ hermes gateway restart
 ### 结构
 
 ```
-__init__.py          # 插件入口：adapter 覆写 + 10 个 hook + clarify 按钮卡
+__init__.py          # 插件入口：公开 ctx.register_platform + 10 个 hook + clarify 按钮卡
 plugin.yaml          # 插件清单（插件 ID = catalog key = lark-card-for-hermes）
+turn_state.py        # 显式每回合注册表（替代进程级「当前回合」全局变量）
+compat/              # 内置 adapter 条目的薄兼容层（声明并测试支持范围）
+tests/               # 10 项行为判据（隔离 HERMES_HOME），run_all.py 一键全跑
 hfc/                 # HFC 渲染栈（MIT），原样复用
   bridge.py          #   ← 本项目新增：事件翻译层
   client.py          #   ← 本项目新增：最小 REST 通道
   render.py session.py cardkit.py card_timeline.py native_tables.py ...
 ```
 
-`hfc/` 下的渲染与状态机代码来自 [Hermes Feishu Streaming Card](https://github.com/baileyh8/hermes-feishu-streaming-card)（MIT）。本项目新增的只有接线层（`bridge.py` / `client.py`）与 adapter 覆写（`__init__.py`）。
+`hfc/` 下的渲染与状态机代码来自 [Hermes Feishu Streaming Card](https://github.com/baileyh8/hermes-feishu-streaming-card)（MIT）。本项目新增的是接线层（`bridge.py` / `client.py`）、回合注册表（`turn_state.py`）、条目薄兼容层（`compat/`）、插件入口（`__init__.py`）与行为判据（`tests/`）。
 
 ### 已知限制
 
