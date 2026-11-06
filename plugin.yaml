@@ -1,5 +1,5 @@
 name: lark-card-for-hermes
-version: 1.7.4
+version: 1.7.5
 description: >
   Lark Card for Hermes: renders Feishu/Lark outbound messages as interactive cards (cardkit streaming,
   tool timeline, reasoning panel, native tables, token footer) by replacing only the bundled Feishu
@@ -21,3 +21,6 @@ provides_hooks:
   - post_api_request
   - post_llm_call
 kind: platform
+python_dependencies:
+  - "aiohttp>=3.8"
+
