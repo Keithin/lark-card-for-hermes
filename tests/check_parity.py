@@ -91,16 +91,16 @@ assert valid_legacy_receipt(receipt), "receipt must satisfy the static-receipt c
 
 # ── 4. 命令卡 ────────────────────────────────────────────────────────────────
 reply = "✅ 卡片预设已切换到 task"
-assert m._command_card(reply) is None, "unregistered text must not become a command card"
+assert m._command_card(reply) == (None, ""), "unregistered text must not become a command card"
 m._mark_command_reply("card-preset", reply)
-cmd_card = m._command_card(reply)
+cmd_card, _center = m._command_card(reply)
 assert cmd_card, "registered command reply must render as a command card"
 flat_c = json.dumps(cmd_card, ensure_ascii=False)
 assert "card-preset" in flat_c and "task" in flat_c
 assert cmd_card["header"]["template"] == "green"
 m._mark_command_reply("card-preset", "❌ 失败")
-assert m._command_card("❌ 失败")["header"]["template"] == "red"
-assert m._command_card("普通回答") is None
+assert m._command_card("❌ 失败")[0]["header"]["template"] == "red"
+assert m._command_card("普通回答")[0] is None
 
 # ── 5. 标题：notice 取正文首行；v1 兜底卡不再硬编码 "Hermes" ─────────────────────
 b.answer_frame("oc_n", "抖音热点榜 · Top 50\n\n完整 50 行表格……", create_notice=True)

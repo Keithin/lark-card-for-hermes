@@ -18,6 +18,7 @@ edit 时一并上屏。
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -39,13 +40,20 @@ try:
     )
     from .hfc.existing_owner_projection import project_existing_owner
     from .hfc.legacy_owner import static_legacy_receipt
-    from .hfc.native_commands import SAFE_QUICK_COMMANDS
+    from .hfc.native_commands import (
+        NATIVE_RESULT_COMMANDS, SAFE_QUICK_COMMANDS,
+        build_command_center_card, build_native_result_card,
+        collect_hermes_command_catalog,
+    )
     from .hfc.owner_display_policy import OwnerRefreshState, collapsed_transfer_elements
     from .hfc.render import CardRenderResult
     from .hfc.text import TableOverflowResult
     from .hfc.canonical_turn import consume_canonical_turn_id, publish_canonical_turn_id
     from .hfc.client import RestClient
-    from .hfc.config_rules import READING_PRESETS, normalize_reading_preset
+    from .hfc.config_rules import (
+        READING_PRESETS, TOOL_ACTIVITY_MODES,
+        normalize_reading_preset, normalize_tool_activity,
+    )
     from .hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from .hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
     from .hfc.interaction_input import InteractionInputError, parse_choice
@@ -62,13 +70,20 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
     )
     from hfc.existing_owner_projection import project_existing_owner
     from hfc.legacy_owner import static_legacy_receipt
-    from hfc.native_commands import SAFE_QUICK_COMMANDS
+    from hfc.native_commands import (
+        NATIVE_RESULT_COMMANDS, SAFE_QUICK_COMMANDS,
+        build_command_center_card, build_native_result_card,
+        collect_hermes_command_catalog,
+    )
     from hfc.owner_display_policy import OwnerRefreshState, collapsed_transfer_elements
     from hfc.render import CardRenderResult
     from hfc.text import TableOverflowResult
     from hfc.canonical_turn import consume_canonical_turn_id, publish_canonical_turn_id
     from hfc.client import RestClient
-    from hfc.config_rules import READING_PRESETS, normalize_reading_preset
+    from hfc.config_rules import (
+        READING_PRESETS, TOOL_ACTIVITY_MODES,
+        normalize_reading_preset, normalize_tool_activity,
+    )
     from hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
     from hfc.interaction_input import InteractionInputError, parse_choice
@@ -221,10 +236,57 @@ def _preview(tool_name: str, args: Any) -> str:
 
 # ── 命令卡（HFC command_cards / native_commands）───────────────────────────────
 # 斜杠命令的回复是「命令反馈」而不是回答：HFC 给它单独的卡（标题/配色随命令与结果）。
-# shortcut: 网关送命令回复时不带命令名，所以用「命令 handler 先登记正文」这一条确定性的边，
-# 只在插件自己注册的命令上生效；要覆盖内置命令得等上游在 send metadata 里给出命令名。
+# 命令名的两个来源：
+#   1. 插件自己注册的命令：handler 返回前 `_mark_command_reply` 用回复正文登记（确定性最高）。
+#   2. 核心命令：`pre_gateway_dispatch` 钩子拿到 event（命令名 + chat + event 本身），
+#      send() 在「该 chat 没有进行中回合」时按 chat 认领一次 —— HFC 用的是同一份 event。
 _COMMAND_REPLY_TTL = 120.0
 _COMMAND_REPLIES: dict[str, tuple[float, str]] = {}   # 回复正文 -> (登记时刻, 命令名)
+# shortcut: 核心命令按 chat 认领（TTL 内一次性），同 chat 若在 TTL 内先来回合外通知会误认；
+# 30s + turn 为空的双重条件把窗口压到最小，真出错时最坏只是那张卡换了标题。
+_COMMAND_CONTEXT_TTL = 30.0
+_COMMAND_CONTEXTS: dict[str, dict[str, Any]] = {}     # chat_id -> {command, ts, event}
+_CENTER_STATE_TTL = 900.0
+_CENTER_STATES: dict[str, dict[str, Any]] = {}        # center_id -> {chat_id, ts, event}
+
+
+def _platform_name(source: Any) -> str:
+    value = getattr(source, "platform", "")
+    return str(getattr(value, "value", value) or "").strip().lower()
+
+
+def _on_pre_gateway_dispatch(*, event: Any = None, **_kw: Any) -> None:
+    """记下 feishu 的斜杠命令：命令名 + chat + event（命令中心「运行」按钮要复投它）。
+
+    这是公开钩子（`VALID_HOOKS` 里的 `pre_gateway_dispatch`），只在消息进入时触发；
+    任何异常都必须吞掉——插件不能挡住消息派发。
+    """
+    try:
+        source = getattr(event, "source", None)
+        if _platform_name(source) != "feishu":
+            return None
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        getter = getattr(event, "get_command", None)
+        command = str(getter() or "").strip().lower().lstrip("/") if callable(getter) else ""
+        if not chat_id or not command:
+            return None
+        now = time.monotonic()
+        for stale, item in list(_COMMAND_CONTEXTS.items()):
+            if now - float(item.get("ts") or 0.0) > _COMMAND_CONTEXT_TTL:
+                _COMMAND_CONTEXTS.pop(stale, None)
+        _COMMAND_CONTEXTS[chat_id] = {"command": command, "ts": now, "event": event}
+    except Exception:
+        logger.debug("[feishu-card] pre_gateway_dispatch 记录失败", exc_info=True)
+    return None
+
+
+def _take_command_context(chat_id: str) -> Optional[dict[str, Any]]:
+    item = _COMMAND_CONTEXTS.pop(str(chat_id or "").strip(), None)
+    if not item:
+        return None
+    if time.monotonic() - float(item.get("ts") or 0.0) > _COMMAND_CONTEXT_TTL:
+        return None
+    return item
 
 
 def _mark_command_reply(command: str, text: str) -> None:
@@ -239,21 +301,48 @@ def _mark_command_reply(command: str, text: str) -> None:
     _COMMAND_REPLIES[body] = (now, str(command or "").strip().lower())
 
 
-def _command_card(text: str) -> Optional[dict]:
-    """命令回复 -> 命令卡；不是命令回复就返回 None（正常卡路径接管）。"""
-    hit = _COMMAND_REPLIES.get((text or "").strip())
-    if hit is None:
-        return None
-    ts, command = hit
-    if time.monotonic() - ts > _COMMAND_REPLY_TTL:
-        return None
-    if command and command not in SAFE_QUICK_COMMANDS and command != "card-preset":
-        return None
-    body = (text or "").strip()
+def _build_command_card(
+    command: str, body: str, chat_id: str = "", *, event: Any = None,
+) -> tuple[dict, str]:
+    """按命令名选卡型：`/commands` → 三层命令中心；核心结果命令 → 指标卡；其余 → 通用卡。"""
+    if command == "commands":
+        catalog = collect_hermes_command_catalog()
+        if catalog:
+            center_id = "center_" + hashlib.sha256(
+                f"{chat_id}:{command}:{time.monotonic()}".encode("utf-8")
+            ).hexdigest()[:16]
+            _CENTER_STATES[center_id] = {
+                "chat_id": str(chat_id or ""), "ts": time.monotonic(), "event": event,
+            }
+            return build_command_center_card(catalog, center_id=center_id), center_id
+    if command in NATIVE_RESULT_COMMANDS:
+        return build_native_result_card(command, body), ""
     return hfc_command_result_card(
         title=hfc_command_result_title(command),
         content=body,
         template=hfc_command_result_template(body),
+    ), ""
+
+
+def _command_card(
+    text: str, chat_id: str = "", *, turn_live: bool = False,
+) -> tuple[Optional[dict], str]:
+    """命令回复 -> (命令卡, center_id)；不是命令回复就返回 (None, "")。"""
+    body = (text or "").strip()
+    if not body:
+        return None, ""
+    hit = _COMMAND_REPLIES.pop(body, None)      # 一次性消费：同一正文不会认领第二次
+    if hit is not None:
+        ts, command = hit
+        if time.monotonic() - ts <= _COMMAND_REPLY_TTL and command:
+            return _build_command_card(command, body, chat_id)
+    if turn_live:
+        return None, ""                          # 进行中回合的正文不是命令反馈
+    item = _take_command_context(chat_id)
+    if not item:
+        return None, ""
+    return _build_command_card(
+        str(item.get("command") or ""), body, chat_id, event=item.get("event"),
     )
 
 
@@ -596,7 +685,53 @@ def _build_adapter_class(base: Any) -> type:
                 if isinstance(action_value, dict) and action_value.get("hermes_clarify_action"):
                     return self._handle_clarify_card_action(
                         event=getattr(data, "event", None), action_value=action_value, loop=loop)
+                if isinstance(action_value, dict) and action_value.get("hfc_action") == "command_center":
+                    return self._handle_command_center_action(
+                        event=getattr(data, "event", None), action_value=action_value, loop=loop)
             return super()._on_card_action_trigger(data)
+
+        def _handle_command_center_action(self, *, event: Any, action_value: dict[str, Any], loop: Any) -> Any:
+            """命令中心的分层导航：home/category/detail 原地换卡；run 把命令复投进网关。
+
+            卡片用 `_card_response(card)` 内联更新（飞书 raw card 回调），不额外发消息；
+            校验点与 HFC 相同：center_id 有效、未过期、chat 对得上。
+            """
+            try:
+                context = getattr(event, "context", None)
+                chat_id = str(getattr(context, "open_chat_id", "") or "").strip()
+                center_id = str(action_value.get("hfc_command_center_id") or "").strip()
+                now = time.monotonic()
+                for stale, item in list(_CENTER_STATES.items()):
+                    if now - float(item.get("ts") or 0.0) > _CENTER_STATE_TTL:
+                        _CENTER_STATES.pop(stale, None)
+                state = _CENTER_STATES.get(center_id)
+                if not state or not chat_id or str(state.get("chat_id") or "") != chat_id:
+                    logger.debug("[feishu-card] 命令中心回调无效或已过期: %s", center_id)
+                    return self._card_response()
+                nav = str(action_value.get("hfc_command_center_nav") or "").strip().lower()
+                command = str(action_value.get("hfc_command_center_command") or "").strip()
+                category = str(action_value.get("hfc_command_center_category") or "").strip()
+                if nav == "run":
+                    source_event = state.get("event")
+                    if not command or command not in SAFE_QUICK_COMMANDS or source_event is None:
+                        return self._card_response()
+                    run_event = copy.copy(source_event)
+                    run_event.text = f"/{command}"
+                    if not self._submit_on_loop(loop, self.handle_message(run_event)):
+                        logger.warning("[feishu-card] 命令中心复投失败: /%s", command)
+                    return self._card_response()
+                catalog = collect_hermes_command_catalog()
+                if not catalog:
+                    return self._card_response()
+                card = build_command_center_card(
+                    catalog, center_id=center_id,
+                    selected_category=category if nav in {"category", "detail"} else "",
+                    selected_command=command if nav == "detail" else "",
+                )
+                return self._card_response(card)
+            except Exception as exc:      # 菜单点坏了不能影响别的卡
+                logger.warning("[feishu-card] 命令中心回调处理失败: %s", exc)
+                return self._card_response()
 
         def _handle_clarify_card_action(self, *, event: Any, action_value: dict[str, Any], loop: Any) -> Any:
             clarify_id = str(action_value.get("clarify_id") or "")
@@ -792,7 +927,8 @@ def _build_adapter_class(base: Any) -> type:
                         chat_id, (turn.turn_id if turn else "-"), len(formatted), is_progress,
                         len(self._tool_lines))
             # 斜杠命令的反馈不是回答：用 HFC 的命令卡（标题/配色随命令与结果）。
-            command_card = None if is_progress else _command_card(formatted)
+            command_card, _center_id = (None, "") if is_progress else _command_card(
+                formatted, chat_id, turn_live=turn is not None)
             if command_card is not None:
                 try:
                     response = await self._feishu_send_with_retry(
@@ -990,6 +1126,8 @@ def _build_adapter_class(base: Any) -> type:
 
 _HOOKS = (
     ("post_gateway_admission", _on_admission),
+    # 命中的斜杠命令（公开钩子）：记 command + event，命令中心据此出卡/复投
+    ("pre_gateway_dispatch", _on_pre_gateway_dispatch),
     ("pre_tool_call", _on_pre_tool_call),
     ("post_tool_call", _on_post_tool_call),
     ("subagent_start", _on_subagent_start),
@@ -1082,6 +1220,69 @@ def _on_card_preset(raw_args: str) -> str:
     return reply
 
 
+# ── /card-activity：切换实时工具调用显示 ────────────────────────────────────────
+_ACTIVITY_CHOICES: list = [
+    {"value": "full", "label": "full", "description": "完整显示每个工具"},
+    {"value": "summary", "label": "summary", "description": "只显示执行步数"},
+    {"value": "hidden", "label": "hidden", "description": "实时完全隐藏工具"},
+]
+
+
+def _write_tool_activity(activity: str, config_path: Optional[Path] = None) -> str:
+    """把 tool_activity 写进 config.json；返回规范化名字。"""
+    name = normalize_tool_activity(activity)
+    path = config_path or (Path(__file__).parent / "config.json")
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    raw_card = cfg.get("card")
+    card = dict(raw_card) if isinstance(raw_card, dict) else {}
+    card["tool_activity"] = name
+    cfg["card"] = card
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return name
+
+
+def _activity_usage(note: str = "") -> str:
+    current = (_TURNS.config or {}).get("tool_activity", "full")
+    head = f"{note}\n" if note else ""
+    return (
+        f"{head}用法：/card-activity <full|summary|hidden>（当前：{current}）\n"
+        "full=完整显示每个工具 · summary=只显示执行步数 · hidden=实时完全隐藏工具"
+    )
+
+
+def _on_card_activity(raw_args: str) -> str:
+    """``/card-activity [名字]``：无参数弹选择菜单，有参数直接切换。"""
+    arg = (raw_args or "").strip()
+    if not arg:
+        picked = None
+        try:
+            from hermes_cli.plugin_choices import ask_choice
+            picked = ask_choice("切换实时工具显示", _ACTIVITY_CHOICES)
+        except Exception:
+            logger.debug("[feishu-card] ask_choice unavailable; falling back to usage text", exc_info=True)
+        if not picked:
+            usage = _activity_usage()
+            _mark_command_reply("card-activity", usage)
+            return usage
+        arg = picked
+    try:
+        name = _write_tool_activity(arg)
+    except ValueError as exc:
+        return _activity_usage(str(exc))
+    except OSError as exc:
+        return f"写入 config.json 失败：{exc}"
+    with _TURNS_LOCK:
+        _TURNS.config = load_card_config()
+    reply = f"✅ 实时工具显示已切换到 {name}（已写入 config.json，下一条消息生效，无需重启）"
+    _mark_command_reply("card-activity", reply)
+    return reply
+
+
 def _adapter_factory(base: Any) -> Any:
     """公开注册入口的 factory：``PlatformConfig -> 本插件的适配器实例``。"""
     adapter_class = _build_adapter_class(base)
@@ -1125,4 +1326,9 @@ def register(ctx: Any) -> None:
         "card-preset", _on_card_preset,
         description="切换飞书卡片阅读预设（classic/focused/detailed/task）",
         args_hint="<classic|focused|detailed|task>",
+    )
+    ctx.register_command(
+        "card-activity", _on_card_activity,
+        description="切换实时工具调用显示（full/summary/hidden）",
+        args_hint="<full|summary|hidden>",
     )

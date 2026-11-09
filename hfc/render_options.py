@@ -57,5 +57,6 @@ def card_render_options(config: Mapping[str, Any]) -> dict[str, Any]:
         native_tables=_boolean(config.get("native_tables"), False),
         width_mode=config.get("width_mode", "default"),
         presentation=config.get("_presentation_mode", "classic"),
+        tool_activity=str(config.get("tool_activity", "full")).strip().lower(),
     )
     return result

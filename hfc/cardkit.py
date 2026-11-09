@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 from .card_limits import serialize_card_for_delivery
 from .delivery import FeishuAPIError
+from .flush import FlushController
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,22 @@ logger = logging.getLogger(__name__)
 MAX_ENTITIES = 4096
 ENTITY_RETENTION_SECONDS = 7200.0
 STREAM_LIFETIME_SECONDS = 540.0
-MIN_MUTATION_INTERVAL = 0.125
+# Per-mutation rate limit; the transport also coalesces rapid updates into one
+# flush every FLUSH_INTERVAL_SECONDS, so this mostly protects burst edges.
+MIN_MUTATION_INTERVAL = 0.05
+FLUSH_INTERVAL_SECONDS = 0.1
+
+
+class _Metrics:
+    """Minimal metrics sink for FlushController; values are not exported."""
+
+    def __init__(self) -> None:
+        self.update_scheduled = 0
+        self.update_coalesced = 0
+        self.update_queue_peak = 0
+        self.terminal_drains = 0
+        self.terminal_drain_latency_ms = 0
+        self.terminal_drain_timeouts = 0
 
 
 def _normalize_element_ids(card: dict[str, Any]) -> dict[str, Any]:
@@ -109,6 +125,9 @@ class Entity:
     last_full_update: float = field(default_factory=time.monotonic)
     last_mutation: float | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    flush_controller: FlushController | None = None
+    pending_card: dict[str, Any] | None = None
+    pending_finalize: bool = False
 
 
 class CardKitTransport:
@@ -206,9 +225,41 @@ class CardKitTransport:
         if entity is None:
             return False
         serialize_card_for_delivery(card)
+        final = _normalize_element_ids(card)
+        is_terminal = final.get('config', {}).get('streaming_mode') is not True
+
+        entity.pending_card = final
+        entity.pending_finalize = entity.pending_finalize or is_terminal
+        entity.touched_at = time.monotonic()
+
+        if entity.flush_controller is None:
+            entity.flush_controller = FlushController(
+                interval_seconds=FLUSH_INTERVAL_SECONDS,
+                metrics=_Metrics(),
+            )
+
+        async def _flush() -> bool:
+            return await self._do_flush(entity)
+
+        entity.flush_controller.schedule(_flush, terminal=is_terminal)
+
+        if is_terminal:
+            await entity.flush_controller.drain(timeout_seconds=5.0)
+            entity.flush_controller.close()
+            entity.flush_controller = None
+
+        return True
+
+    async def _do_flush(self, entity: Entity) -> bool:
+        """Execute one batched card update: diff, streaming close, then mutation."""
         async with entity.lock:
-            final = _normalize_element_ids(card)
-            config = final.setdefault('config', {})
+            card = entity.pending_card
+            if card is None:
+                return True
+            entity.pending_card = None
+            entity.pending_finalize = False
+
+            config = card.setdefault('config', {})
             requested_streaming = config.get('streaming_mode') is True
             if entity.streaming and (
                 not requested_streaming
@@ -222,23 +273,20 @@ class CardKitTransport:
                 entity.streaming = False
             config['streaming_mode'] = entity.streaming and requested_streaming
             previous_structure, previous_text = _text_partition(entity.card)
-            structure, text = _text_partition(final)
+            structure, text = _text_partition(card)
             full_update = (not entity.streaming or structure != previous_structure
-                           or any(not content and previous_text.get(key) for key, content in text.items())
-                           or time.monotonic() - entity.last_full_update >= 2.0)
+                           or any(not content and previous_text.get(key) for key, content in text.items()))
             if full_update:
                 await self._mutate(entity, 'PUT', '', {
-                    'card': {'type': 'card_json', 'data': serialize_card_for_delivery(final)},
+                    'card': {'type': 'card_json', 'data': serialize_card_for_delivery(card)},
                 })
                 entity.last_full_update = time.monotonic()
-                entity.card = final
+                entity.card = card
             else:
                 for element_id, content in text.items():
                     if previous_text.get(element_id) != content:
                         await self._mutate(entity, 'PUT', f'/elements/{quote(element_id, safe="")}/content', {
                             'content': content,
                         })
-                # Footer/summary refresh is intentionally periodic, not a full
-                # replacement on every token. The terminal path always flushes.
-                entity.card = final
+                entity.card = card
             return True

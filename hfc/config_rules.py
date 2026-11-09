@@ -14,6 +14,11 @@ from typing import Any
 # successful and failed terminals, including an explicit False override.
 HIDE_SUCCESSFUL_TOOL_ACTIVITY = "_hide_successful_tool_activity"
 PRESENTATION_MODE = "_presentation_mode"
+# Live tool activity in the card: ``full`` keeps the current per-tool rows,
+# ``summary`` shows only generic progress, ``hidden`` drops the live surfaces.
+# Terminal rendering stays governed by the hide-completed switches so this
+# setting cannot change a finished card.
+TOOL_ACTIVITY_MODES = ("full", "summary", "hidden")
 READING_PRESETS = {
     "classic": {
         PRESENTATION_MODE: "classic",
@@ -55,6 +60,7 @@ READING_PRESETS = {
 READING_FIELDS = (
     "reading_preset", "show_reasoning", "stream_thinking_to_body",
     "hide_completed_tool_activity", "reasoning_format", "timeline_expanded",
+    "tool_activity",
     "max_timeline_items", "max_reasoning_chars", "max_tool_result_chars",
     "table_overflow_mode",
     "native_tables",
@@ -118,6 +124,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "stream_thinking_to_body": True,
         "thinking_body_tail_chars": 0,
         "hide_completed_tool_activity": False,
+        "tool_activity": "full",
         "reasoning_format": "panel",
         "timeline_expanded": False,
         "timeline_order": "newest_first",
@@ -226,6 +233,14 @@ def normalize_table_overflow_mode(
 def normalize_width_mode(value: object, *, path: str = "card.width_mode") -> str:
     if not isinstance(value, str) or value.strip().lower() not in {"default", "compact", "fill"}:
         raise ValueError(f"{path} must be default, compact or fill")
+    return value.strip().lower()
+
+
+def normalize_tool_activity(
+    value: object, *, path: str = "card.tool_activity"
+) -> str:
+    if not isinstance(value, str) or value.strip().lower() not in TOOL_ACTIVITY_MODES:
+        raise ValueError(f"{path} must be full, summary or hidden")
     return value.strip().lower()
 
 
@@ -416,6 +431,10 @@ def normalize_card_config(value: object, *, path: str) -> None:
     if "streaming_mode" in value:
         value["streaming_mode"] = normalize_boolean(
             value["streaming_mode"], f"{path}.streaming_mode"
+        )
+    if "tool_activity" in value:
+        value["tool_activity"] = normalize_tool_activity(
+            value["tool_activity"], path=f"{path}.tool_activity"
         )
     if "reasoning_format" in value:
         raw_format = value["reasoning_format"]
