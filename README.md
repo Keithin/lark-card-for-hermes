@@ -21,11 +21,13 @@ This is a Hermes **platform plugin**. It overrides only the Feishu adapter's out
 - **Reasoning panel** — thinking goes into a collapsible block instead of the answer body.
 - **Native tables** — Markdown tables become Feishu `table` components.
 - **Footer** — duration, model, input/output tokens, context usage.
-- **Streaming body** — updates as it generates, no leftover cursor glyph when it finishes.
+- **Streaming body** — updates as it generates, no leftover cursor glyph when it finishes. Updates are coalesced and throttled to Feishu's 10-mutations-per-second per-card limit, with a 2 s full refresh so the footer clock keeps moving.
 - **Interactive clarify** — `clarify` options render as real buttons that send the answer back; a clicked card is frozen into a static receipt (text only, no controls), and expired or superseded prompts have their buttons withdrawn.
 - **Honest out-of-turn cards** — startup/cron notifications and slash-command replies have no turn behind them, so they render as a notice card marked done instead of a card stuck on `⏳ running` with a growing clock.
 - **Crash-safe cards** — each running turn keeps a display checkpoint. If the gateway dies mid-turn, the next start freezes that card into a finished "已中断" card (content kept, no spinner) instead of leaving it spinning forever.
 - **Command cards** — slash-command feedback gets its own card: title by command, colour by outcome (green done / red failed / blue running / orange warning).
+- **Command center** — the `/commands` menu renders as a three-level card (overview → category → detail) whose buttons navigate categories, go back, or re-dispatch a command; metric commands such as `/status` render as result cards with metric columns.
+- **Switch commands** — `/card-preset` and `/card-activity` change the reading preset and the live tool-call display (`full` / `summary` / `hidden`) on the fly.
 
 ### Why it does not break when Hermes upgrades
 
@@ -37,7 +39,7 @@ This project does the opposite:
 | --- | --- | --- |
 | Modifies Hermes source | Yes | **No** |
 | Whole-file byte verification | Yes (breaks on upgrade) | No |
-| Event source | Injected hooks | Official plugin hooks (10 of them, all in `VALID_HOOKS`) |
+| Event source | Injected hooks | Official plugin hooks (11 of them, all in `VALID_HOOKS`) |
 | Surface area | Many private symbols | Public `ctx.register_platform`; private seams confined to `compat/` (see `hermes plugins validate` output) |
 | Current-turn state | Process-wide globals | Explicit per-turn registry (`turn_state.py`): platform + session_key + chat/thread, keyed by public `turn_id` |
 
@@ -47,7 +49,7 @@ Even if upstream changes a private function we depend on, the failure mode is **
 
 ### Requirements
 
-- Hermes Agent with a plugin system and hooks such as `post_gateway_admission`
+- Hermes Agent **≥ 0.22** with a plugin system and hooks such as `post_gateway_admission` (tested on 0.23.x; `tests/run_all.py` 13/13 green)
 - `lark-oapi` **1.6.8** — that version's `Client._handle_data_frame` silently drops CARD frames, which makes **card button clicks do nothing**. `hfc/feishu_ws_compat.py` matches that function body by AST hash and repairs it; on a version mismatch it declines automatically (`connect()` logs whether the repair was applied).
 
 ### Install
@@ -113,11 +115,11 @@ Listed chats get native Feishu text; everything else keeps cards. An empty array
 ### Layout
 
 ```
-__init__.py          # plugin entry: public ctx.register_platform + 10 hooks + clarify button cards
+__init__.py          # plugin entry: public ctx.register_platform + 11 hooks + clarify button cards
 plugin.yaml          # manifest (plugin ID = catalog key = lark-card-for-hermes)
 turn_state.py        # explicit per-turn registry (replaces process-wide current-turn globals)
 compat/              # thin layer over the bundled adapter's registry entry (tested support range)
-tests/               # 10 behavior checks (isolated HERMES_HOME), run_all.py runs them all
+tests/               # 13 behavior checks (isolated HERMES_HOME), run_all.py runs them all
 hfc/                 # HFC rendering stack (MIT), used as-is
   bridge.py          #   ← new here: event translation layer
   client.py          #   ← new here: minimal REST channel
@@ -154,11 +156,13 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 - **思考面板**：推理进可折叠区域，不占正文。
 - **原生表格**：Markdown 表格渲染成飞书 `table` 组件。
 - **footer**：用时、模型、输入/输出 token、上下文用量。
-- **流式正文**：边生成边更新，结束不留光标字符。
+- **流式正文**：边生成边更新，结束不留光标字符。更新做攒批合并并按飞书单卡 10 次/秒上限限速，另有 2s 周期整卡刷新，footer 计时不会冻住。
 - **交互式 clarify**：选项渲染成真按钮，点了会真的回传；点过的卡冻结成静态回执（只留文字、不留控件），超时或被取代的提问会把按钮撤下。
 - **回合外卡片不装忙**：启动通知、定时任务、斜杠命令的回复身后没有回合，渲染成已收尾的 notice 卡，而不是一张永远「⏳ 执行中」、计时还在涨的卡。
 - **进程挂掉也不留转圈卡**：每个进行中的回合都有展示检查点；网关中途挂掉时，下次启动会把那张卡冻结成「已中断」（正文保留、不再转圈）。
 - **命令卡**：斜杠命令的反馈用专门的卡——标题随命令、配色随结果（绿=完成 / 红=失败 / 蓝=进行中 / 橙=警告）。
+- **命令中心**：`/commands` 菜单渲染成三层卡（概览 → 分类 → 详情），按钮能跳分类、返回、复投命令；`/status` 这类指标命令渲染成带指标列的结果卡。
+- **切换命令**：`/card-preset`、`/card-activity` 随时切换阅读预设和实时工具调用显示（`full` / `summary` / `hidden`）。
 
 ### 为什么不会因为 Hermes 升级而挂
 
@@ -170,7 +174,7 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 | --- | --- | --- |
 | 改动 Hermes 源码 | 是 | **否** |
 | 整文件字节校验 | 是（升级即失效） | 否 |
-| 事件来源 | 注入 hook | 官方插件 hook（`VALID_HOOKS` 内的 10 个） |
+| 事件来源 | 注入 hook | 官方插件 hook（`VALID_HOOKS` 内的 11 个） |
 | 接口面 | 大量私有符号 | 公开 `ctx.register_platform`；私有接缝集中在 `compat/`（清单见 `hermes plugins validate`） |
 | 当前回合状态 | 进程级全局变量 | 显式每回合注册表（`turn_state.py`）：platform + session_key + chat/thread，以公开 `turn_id` 标识 |
 
@@ -180,7 +184,7 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 
 ### 依赖
 
-- 带插件系统和 `post_gateway_admission` 等 hooks 的 Hermes Agent
+- 带插件系统和 `post_gateway_admission` 等 hooks 的 Hermes Agent **≥ 0.22**（0.23.x 上 `tests/run_all.py` 13/13 全绿）
 - `lark-oapi` **1.6.8** —— 该版本的 `Client._handle_data_frame` 会静默丢弃 CARD 帧，导致**卡片按钮点击无效**。`hfc/feishu_ws_compat.py` 用 AST 精确匹配那段函数体并修掉；版本不符会自动放弃（`connect()` 成功后日志会写明是否修复）。
 
 ### 安装
@@ -246,11 +250,11 @@ hermes gateway restart
 ### 结构
 
 ```
-__init__.py          # 插件入口：公开 ctx.register_platform + 10 个 hook + clarify 按钮卡
+__init__.py          # 插件入口：公开 ctx.register_platform + 11 个 hook + clarify 按钮卡
 plugin.yaml          # 插件清单（插件 ID = catalog key = lark-card-for-hermes）
 turn_state.py        # 显式每回合注册表（替代进程级「当前回合」全局变量）
 compat/              # 内置 adapter 条目的薄兼容层（声明并测试支持范围）
-tests/               # 10 项行为判据（隔离 HERMES_HOME），run_all.py 一键全跑
+tests/               # 13 项行为判据（隔离 HERMES_HOME），run_all.py 一键全跑
 hfc/                 # HFC 渲染栈（MIT），原样复用
   bridge.py          #   ← 本项目新增：事件翻译层
   client.py          #   ← 本项目新增：最小 REST 通道
