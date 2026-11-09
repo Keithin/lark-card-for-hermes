@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 MAX_ENTITIES = 4096
 ENTITY_RETENTION_SECONDS = 7200.0
 STREAM_LIFETIME_SECONDS = 540.0
-# Per-mutation rate limit; the transport also coalesces rapid updates into one
-# flush every FLUSH_INTERVAL_SECONDS, so this mostly protects burst edges.
-MIN_MUTATION_INTERVAL = 0.05
+# Feishu caps card-entity operations at 10/s per card (official cardkit docs);
+# HFC's tuned 0.125s (8/s) stays under it. FlushController coalesces bursts on top.
+MIN_MUTATION_INTERVAL = 0.125
 FLUSH_INTERVAL_SECONDS = 0.1
 
 
@@ -127,7 +127,6 @@ class Entity:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     flush_controller: FlushController | None = None
     pending_card: dict[str, Any] | None = None
-    pending_finalize: bool = False
 
 
 class CardKitTransport:
@@ -229,7 +228,6 @@ class CardKitTransport:
         is_terminal = final.get('config', {}).get('streaming_mode') is not True
 
         entity.pending_card = final
-        entity.pending_finalize = entity.pending_finalize or is_terminal
         entity.touched_at = time.monotonic()
 
         if entity.flush_controller is None:
@@ -239,14 +237,24 @@ class CardKitTransport:
             )
 
         async def _flush() -> bool:
-            return await self._do_flush(entity)
+            try:
+                return await self._do_flush(entity)
+            except Exception:
+                # 中间帧失败会被下一帧覆盖重试；最终帧的异常经 drain 传回调用方回落。
+                logger.warning(
+                    'CardKit flush failed: entity_hash=%s',
+                    sha256(entity.card_id.encode()).hexdigest()[:12], exc_info=True)
+                raise
 
         entity.flush_controller.schedule(_flush, terminal=is_terminal)
 
         if is_terminal:
-            await entity.flush_controller.drain(timeout_seconds=5.0)
+            # drain 超时 = 飞书可能没收到最终帧：如实返回 False 让调用方走回落，
+            # 不把「已调度」当「已投递」（update() 的返回值就是投递真相）。
+            flushed = await entity.flush_controller.drain(timeout_seconds=5.0)
             entity.flush_controller.close()
             entity.flush_controller = None
+            return flushed
 
         return True
 
@@ -257,7 +265,6 @@ class CardKitTransport:
             if card is None:
                 return True
             entity.pending_card = None
-            entity.pending_finalize = False
 
             config = card.setdefault('config', {})
             requested_streaming = config.get('streaming_mode') is True
@@ -275,7 +282,8 @@ class CardKitTransport:
             previous_structure, previous_text = _text_partition(entity.card)
             structure, text = _text_partition(card)
             full_update = (not entity.streaming or structure != previous_structure
-                           or any(not content and previous_text.get(key) for key, content in text.items()))
+                           or any(not content and previous_text.get(key) for key, content in text.items())
+                           or time.monotonic() - entity.last_full_update >= 2.0)
             if full_update:
                 await self._mutate(entity, 'PUT', '', {
                     'card': {'type': 'card_json', 'data': serialize_card_for_delivery(card)},
@@ -288,5 +296,7 @@ class CardKitTransport:
                         await self._mutate(entity, 'PUT', f'/elements/{quote(element_id, safe="")}/content', {
                             'content': content,
                         })
+                # Footer/summary refresh is intentionally periodic, not a full
+                # replacement on every token. The terminal path always flushes.
                 entity.card = card
             return True

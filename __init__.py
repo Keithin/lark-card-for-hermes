@@ -57,7 +57,6 @@ try:
     from .hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from .hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
     from .hfc.interaction_input import InteractionInputError, parse_choice
-    from .hfc.observed_rate import ObservedRates
     from .hfc.transient_notices import is_transient_busy_ack, transient_notice_recall_seconds
 except ImportError:  # 判据脚本按文件路径加载插件时没有包上下文
     sys.path.insert(0, str(Path(__file__).parent))
@@ -87,7 +86,6 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
     from hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
     from hfc.interaction_input import InteractionInputError, parse_choice
-    from hfc.observed_rate import ObservedRates
     from hfc.transient_notices import is_transient_busy_ack, transient_notice_recall_seconds
 
 logger = logging.getLogger(__name__)
@@ -136,7 +134,6 @@ def _text_partition(card: dict) -> tuple[dict, dict[str, str]]:
 _TURNS = HfcTurnBridge()
 _TURNS_LOCK = threading.RLock()
 
-_OBSERVED_RATES = ObservedRates()
 _POLICY: Optional[ChatDeliveryPolicy] = None
 
 
@@ -810,9 +807,16 @@ def _build_adapter_class(base: Any) -> type:
 
         async def connect(self, *, is_reconnect: bool = False) -> bool:
             ok = await super().connect(is_reconnect=is_reconnect)
-            if ok and _install_card_frame_repair():
-                logger.info("[feishu-card] 已修复 lark-oapi 的 CARD 帧丢弃（卡片按钮回调可达）")
             if ok:
+                if _install_card_frame_repair():
+                    logger.info("[feishu-card] 已修复 lark-oapi 的 CARD 帧丢弃（卡片按钮回调可达）")
+                else:
+                    # 补丁按函数体哈希匹配：lark-oapi 升级后会自动放弃。若新版 SDK 仍丢
+                    # CARD 帧（1.6.8/1.7.5 都丢），按钮会静默变死（飞书报 200340），
+                    # 这里必须留下可见痕迹，不能无声跳过。
+                    logger.warning(
+                        "[feishu-card] CARD 帧补丁未应用（lark-oapi 版本/函数体变化）；"
+                        "若卡片按钮点击无响应（200340），检查 SDK _handle_data_frame 是否仍丢弃 CARD 帧")
                 await self._close_stale_cards()
             return ok
 

@@ -68,7 +68,7 @@ Credentials reuse Hermes' existing Feishu configuration (environment variables o
 
 ### Configuration
 
-`config.json` is validated by `hfc/config_rules.py`. Every key follows HFC's existing schema:
+`config.json` (plugin root) is runtime state written by `/card-preset` and `/card-activity`, so it is **not tracked in git** — create it by hand or via those commands. Without it the HFC defaults apply; note the default is `native_tables: false` (markdown tables render as pipe text), so set `"native_tables": true` for Feishu-native tables. It is validated by `hfc/config_rules.py`. Every key follows HFC's existing schema:
 
 ```json
 {
@@ -129,7 +129,7 @@ The rendering and state-machine code under `hfc/` comes from [Hermes Feishu Stre
 ### Known limitations
 
 - Session state is kept for the most recent 64 chats (LRU). A chat that falls off the list starts its card from scratch when it returns.
-- `observed_rate` is imported but not wired up, so the footer never shows a rate.
+- The footer never shows a token rate (upstream `observed_rate` was dropped as unwired; re-add from HFC ≥5.0.14 if a rate field is ever wanted).
 
 ### License
 
@@ -201,7 +201,7 @@ hermes gateway restart
 
 ### 配置
 
-`config.json` 会被 `hfc/config_rules.py` 校验，字段名全部沿用 HFC 的原有 schema：
+`config.json`（插件根目录）是 `/card-preset`、`/card-activity` 写入的运行时状态，**不进 git**——手工创建或用命令生成。缺省时用 HFC 默认值；注意默认 `native_tables: false`（表格显示成管道符文本），要飞书原生表格请设 `"native_tables": true`。它会被 `hfc/config_rules.py` 校验，字段名全部沿用 HFC 的原有 schema：
 
 ```json
 {
@@ -262,7 +262,7 @@ hfc/                 # HFC 渲染栈（MIT），原样复用
 ### 已知限制
 
 - 会话状态按 LRU 保留最近 64 个 chat，超出的 chat 再回来时卡片会从头开始。
-- `observed_rate` 已引入但未接线，footer 不显示速率。
+- footer 不显示 token 速率（上游 `observed_rate` 未接线、已移除；需要时从 HFC ≥5.0.14 重新引入）。
 
 ### 许可
 

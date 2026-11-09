@@ -5,3 +5,4 @@ __pycache__/
 config.local.json
 *.log
 state/
+config.json
