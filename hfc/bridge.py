@@ -11,6 +11,8 @@ HFC 原来靠源码 hook + sidecar 投递，这里的事件源是适配器自己
 
 from __future__ import annotations
 
+import os
+
 import json
 import logging
 import time
@@ -30,8 +32,23 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "1"
 
-# 卡片状态检查点：崩溃/重启后能把这它收尾，而不是留在「执行中」。
-STATE_DIR = Path(__file__).resolve().parent.parent / "state"
+# 卡片状态检查点：崩溃/重启后能把它们收尾，而不是留在「执行中」。
+#
+# 放在 HERMES_HOME 下而不是插件目录里，有两个原因：
+#   1. 插件目录可能被 `git clean -fdx` / 重装 / `hermes plugins update` 整体替换，
+#      运行时检查点不该跟着消失（否则网关崩了以后再没人收尾那张卡）；
+#   2. 检查点里含正文快照，`hermes plugins validate` 的安全扫描会把它们当成插件内容
+#      报 `destructive_home_rm` / `dump_all_env` 并判失败。
+# 可用 LARK_CARD_STATE_DIR 覆盖（测试/多实例用）。
+def _state_root() -> Path:
+    override = os.environ.get("LARK_CARD_STATE_DIR")
+    if override:
+        return Path(override).expanduser()
+    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    return Path(home).expanduser() / "state" / "lark-card-for-hermes"
+
+
+STATE_DIR = _state_root()
 CHECKPOINT_INTERVAL = 2.0   # 秒；每帧都落盘等于每帧一次磁盘写
 STALE_AFTER = 600.0         # 秒；比这更老的「执行中」检查点一定是上一个进程留下的
 

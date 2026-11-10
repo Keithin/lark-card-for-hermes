@@ -33,6 +33,15 @@
 判据：`tests/check_compat.py`（6 组）——预览兜底、结构修补命中、already_ok、真干活分支不改写、
 静态平台声明、静态命令注册表。`run_all.py` 13 → **15** 项。
 
+## 运行时状态移出插件目录（1.7.10）
+
+检查点目录从 `<插件>/state/` 改为 `$HERMES_HOME/state/lark-card-for-hermes/`（可用 `LARK_CARD_STATE_DIR` 覆盖），原因两条：
+
+1. `hermes plugins validate` 的安全扫描会读插件目录里的所有 JSON——检查点含正文快照，会被判成 `destructive_home_rm` / `dump_all_env`，**整个插件校验失败**；
+2. 插件目录可能被 `git clean -fdx` / 重装整体替换，运行时检查点不该跟着消失（否则网关崩溃后没人收尾那张「执行中」卡）。
+
+历史检查点已迁移（36 个），插件目录内 `state/` 现在为空。
+
 ## 生效与回滚
 
 - 命令注册与代码改动需要重启网关（`/card-preset`、`/card-activity` 这类只改 config 的才是热加载）。
