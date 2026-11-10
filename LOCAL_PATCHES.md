@@ -16,6 +16,23 @@
 | 9 | `__init__.py` | 命令 | 新增 `/card-status`、`/card-doctor`、`/card-maintenance` |
 | 10 | `tests/check_ops.py` | 判据 | 7 组断言覆盖上述模块（run_all 自动发现，共 14 项） |
 
+## 私有依赖硬化（1.7.9）
+
+上游把三个「Hermes/lark-oapi 内部实现」当作外部契约；这里全部改成「先试上游，失败用本地实现」，
+降级时写日志并由 `/card-status` 展示（`私有 import 降级：…`）：
+
+| 私有面 | 原来的失效形态 | 现在的兜底 |
+|---|---|---|
+| `agent.display.build_tool_preview` | 时间线整片没有参数预览 | `hfc/preview.py` 本地摘要（含敏感键打码） |
+| `hermes_cli.plugin_choices.ask_choice` | 菜单退化成用法文本 | 记录降级并保留「带参数直接切换」路径 |
+| `hermes_cli.commands.COMMAND_REGISTRY` | 命令中心整卡空白 | AST 直读 `commands.py` 的 `CommandDef` 字面量（本机 69 条） |
+| `hermes_cli.plugins.get_plugin_commands` / `agent.skill_commands.get_skill_commands` | 插件/技能命令缺失 | 与静态注册表合并，缺失只是少一类 |
+| lark-oapi `Client._handle_data_frame` | 函数体哈希不匹配就整段放弃 | 先哈希精确匹配，再「CARD 分支存在且是纯丢弃」结构匹配；SDK 已处理时报 `already_ok` |
+| 内置 feishu 平台声明 `recorded_platform_kwargs()` | 录音失败直接放弃注册（降级纯文本） | 失败时 AST 静态解析 `register_platform(...)`，字面量+模块名解析，解析不了才放弃 |
+
+判据：`tests/check_compat.py`（6 组）——预览兜底、结构修补命中、already_ok、真干活分支不改写、
+静态平台声明、静态命令注册表。`run_all.py` 13 → **15** 项。
+
 ## 生效与回滚
 
 - 命令注册与代码改动需要重启网关（`/card-preset`、`/card-activity` 这类只改 config 的才是热加载）。

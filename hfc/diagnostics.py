@@ -84,8 +84,14 @@ class Diagnostics:
         lines.append(f"· 插件 v{version} · Python {facts.get('python')} · 已运行 {facts.get('uptime_s')}s")
         hooks = facts.get("hooks")
         repair = facts.get("card_frame_repair")
+        repair_status = facts.get("card_frame_repair_status")
         if hooks is not None:
-            lines.append(f"· hooks={hooks} · CARD 帧修补={'on' if repair else 'off'}")
+            label = {"repaired": "已修补", "already_ok": "SDK 自带", "unsupported": "未识别"}
+            shown = label.get(str(repair_status), "on" if repair else "off")
+            lines.append(f"· hooks={hooks} · CARD 帧修补={shown}")
+        fallbacks = facts.get("private_import_fallbacks") or []
+        if fallbacks:
+            lines.append("· 私有 import 降级：" + " · ".join(str(f) for f in fallbacks[:3]))
 
         head("投递计数")
         order = ("send", "edit", "card_v1_fallback", "text_fallback", "notice_card",

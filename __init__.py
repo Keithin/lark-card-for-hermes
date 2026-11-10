@@ -55,7 +55,10 @@ try:
         normalize_reading_preset, normalize_tool_activity,
     )
     from .hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
-    from .hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
+    from .hfc.feishu_ws_compat import (
+        _repaired_function as _ws_repaired_function,
+        card_frame_repair_status as _ws_repair_status,
+    )
     from .hfc.interaction_input import InteractionInputError, parse_choice
     from .hfc.transient_notices import is_transient_busy_ack, transient_notice_recall_seconds
     from .hfc.config_snapshot import LEDGER
@@ -65,6 +68,7 @@ try:
     from .hfc.metrics import METRICS
     from .hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice
     from .hfc.observed_rate import RATE
+    from .hfc.preview import tool_preview as _local_tool_preview
 except ImportError:  # 判据脚本按文件路径加载插件时没有包上下文
     sys.path.insert(0, str(Path(__file__).parent))
     from hfc.bridge import HfcTurnBridge, load_card_config
@@ -91,7 +95,10 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
         normalize_reading_preset, normalize_tool_activity,
     )
     from hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
-    from hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
+    from hfc.feishu_ws_compat import (
+        _repaired_function as _ws_repaired_function,
+        card_frame_repair_status as _ws_repair_status,
+    )
     from hfc.interaction_input import InteractionInputError, parse_choice
     from hfc.transient_notices import is_transient_busy_ack, transient_notice_recall_seconds
     from hfc.config_snapshot import LEDGER
@@ -101,11 +108,20 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
     from hfc.metrics import METRICS
     from hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice
     from hfc.observed_rate import RATE
+    from hfc.preview import tool_preview as _local_tool_preview
 
 logger = logging.getLogger(__name__)
 
 # 运行态事实（供 /card-status、/card-doctor 读取；只在进程内，不落盘）
 _RUNTIME_STATE: dict[str, Any] = {"card_frame_repair": False, "registered": False, "hooks": 0}
+
+
+def _note_private_import_fallback(what: str) -> None:
+    """记录一次「私有 import 不可用，已用本地实现兜底」，供 /card-status 展示。"""
+    seen = _RUNTIME_STATE.setdefault("private_import_fallbacks", [])
+    if what not in seen:
+        seen.append(what)
+        logger.info("[feishu-card] 私有 import 不可用，已用本地实现兜底: %s", what)
 
 
 def _error_code(exc: BaseException) -> str:
@@ -174,20 +190,28 @@ _TURNS_LOCK = threading.RLock()
 _POLICY: Optional[ChatDeliveryPolicy] = None
 
 
-def _install_card_frame_repair() -> bool:
-    """lark-oapi 1.6.8 的 `_handle_data_frame` 对 CARD 帧直接 `return`（读 SDK 源码确认），
-    卡片按钮回调（clarify / 审批）会被静默丢弃。这里用 HFC 的 AST 补丁换掉那段分支；
-    版本或字节对不上会自动放弃，不改 SDK 文件、不换 Client 类。"""
+def _install_card_frame_repair() -> str:
+    """lark-oapi 的 `_handle_data_frame` 对 CARD 帧直接 `return`，卡片按钮回调
+    （clarify / 审批）会被静默丢弃。这里用 AST 补丁换掉那段分支：先按函数体哈希精确匹配，
+    对不上再走结构匹配（CARD 分支存在且是纯丢弃就替换），因此 SDK 补丁版不会因为相邻代码
+    变动而整段放弃。不改 SDK 文件、不换 Client 类。
+
+    返回 ``repaired`` / ``already_ok`` / ``unsupported``。
+    """
     try:
         from lark_oapi.ws.client import Client
 
-        repaired = _ws_repaired_function(Client._handle_data_frame)
+        original = Client._handle_data_frame
+        status = _ws_repair_status(original)
+        if status != "repaired":
+            return status
+        repaired = _ws_repaired_function(original)
         if repaired is None:
-            return False
+            return "unsupported"
         Client._handle_data_frame = repaired
-        return True
+        return "repaired"
     except Exception:
-        return False
+        return "unsupported"
 
 
 def _plugin_config() -> dict[str, Any]:
@@ -259,11 +283,22 @@ def _redact(text: str) -> str:
 
 
 def _preview(tool_name: str, args: Any) -> str:
-    """一行工具参数摘要（已脱敏），摘要构造失败就不显示。"""
+    """一行工具参数摘要（已脱敏）。
+
+    优先用核心的 `agent.display.build_tool_preview`（行为与原生 CLI 一致）；
+    该私有模块缺失/改名/返回空时，退回插件自带的 `hfc.preview.tool_preview`，
+    这样时间线不会因为 Hermes 内部重构而整片失去参数预览。
+    """
     try:
         from agent.display import build_tool_preview
 
-        return _redact(build_tool_preview(tool_name, args or {}, max_len=48) or "")
+        text = build_tool_preview(tool_name, args or {}, max_len=48) or ""
+        if text:
+            return _redact(text)
+    except Exception:
+        _note_private_import_fallback("agent.display.build_tool_preview")
+    try:
+        return _redact(_local_tool_preview(tool_name, args or {}, max_len=48))
     except Exception:
         return ""
 
@@ -855,15 +890,17 @@ def _build_adapter_class(base: Any) -> type:
         async def connect(self, *, is_reconnect: bool = False) -> bool:
             ok = await super().connect(is_reconnect=is_reconnect)
             if ok:
-                if _install_card_frame_repair():
-                    _RUNTIME_STATE["card_frame_repair"] = True
+                repair_status = _install_card_frame_repair()
+                _RUNTIME_STATE["card_frame_repair"] = repair_status in {"repaired", "already_ok"}
+                _RUNTIME_STATE["card_frame_repair_status"] = repair_status
+                if repair_status == "repaired":
                     logger.info("[feishu-card] 已修复 lark-oapi 的 CARD 帧丢弃（卡片按钮回调可达）")
+                elif repair_status == "already_ok":
+                    logger.info("[feishu-card] lark-oapi 自身已处理 CARD 帧，无需修补")
                 else:
-                    # 补丁按函数体哈希匹配：lark-oapi 升级后会自动放弃。若新版 SDK 仍丢
-                    # CARD 帧（1.6.8/1.7.5 都丢），按钮会静默变死（飞书报 200340），
-                    # 这里必须留下可见痕迹，不能无声跳过。
+                    # 形态无法识别：可能是新 SDK 换了实现。绝不静默——按钮会变死（200340）。
                     logger.warning(
-                        "[feishu-card] CARD 帧补丁未应用（lark-oapi 版本/函数体变化）；"
+                        "[feishu-card] CARD 帧补丁未应用（lark-oapi 函数形态未识别）；"
                         "若卡片按钮点击无响应（200340），检查 SDK _handle_data_frame 是否仍丢弃 CARD 帧")
                 await self._close_stale_cards()
             return ok
@@ -1284,6 +1321,7 @@ def _on_card_preset(raw_args: str) -> str:
             from hermes_cli.plugin_choices import ask_choice
             picked = ask_choice("切换卡片阅读预设", _PRESET_CHOICES)
         except Exception:
+            _note_private_import_fallback("hermes_cli.plugin_choices.ask_choice")
             logger.debug("[feishu-card] ask_choice unavailable; falling back to usage text", exc_info=True)
         if not picked:
             usage = _preset_usage()
@@ -1349,6 +1387,7 @@ def _on_card_activity(raw_args: str) -> str:
             from hermes_cli.plugin_choices import ask_choice
             picked = ask_choice("切换实时工具显示", _ACTIVITY_CHOICES)
         except Exception:
+            _note_private_import_fallback("hermes_cli.plugin_choices.ask_choice")
             logger.debug("[feishu-card] ask_choice unavailable; falling back to usage text", exc_info=True)
         if not picked:
             usage = _activity_usage()
@@ -1383,6 +1422,8 @@ def _status_facts() -> dict:
     DIAG.register("plugin_version", _plugin_version)
     DIAG.register("hooks", lambda: int(_RUNTIME_STATE.get("hooks") or 0))
     DIAG.register("card_frame_repair", lambda: bool(_RUNTIME_STATE.get("card_frame_repair")))
+    DIAG.register("card_frame_repair_status", lambda: _RUNTIME_STATE.get("card_frame_repair_status", "unknown"))
+    DIAG.register("private_import_fallbacks", lambda: list(_RUNTIME_STATE.get("private_import_fallbacks") or []))
     return DIAG.collect()
 
 
@@ -1492,6 +1533,8 @@ def register(ctx: Any) -> None:
     DIAG.register("plugin_version", _plugin_version)
     DIAG.register("hooks", lambda: int(_RUNTIME_STATE.get("hooks") or 0))
     DIAG.register("card_frame_repair", lambda: bool(_RUNTIME_STATE.get("card_frame_repair")))
+    DIAG.register("card_frame_repair_status", lambda: _RUNTIME_STATE.get("card_frame_repair_status", "unknown"))
+    DIAG.register("private_import_fallbacks", lambda: list(_RUNTIME_STATE.get("private_import_fallbacks") or []))
     ctx.register_command(
         "card-status", _on_card_status,
         description="一次看完卡片运行态：版本/hook/修补/计数/配置是否需重启",

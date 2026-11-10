@@ -18,6 +18,7 @@ deadline 期间，这把锁正被父线程的 `worker.join()` 持有 → 必然�
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util
 import logging
@@ -56,6 +57,23 @@ def _bundled_feishu_root() -> Path:
         from hermes_constants import get_hermes_home
         candidates.append(get_hermes_home() / "hermes-agent" / "plugins" / "platforms" / "feishu")
     except Exception:
+        pass
+
+    # 3. glob 兜底：包布局变了（plugins 换目录层级/多版本共存）也能找到
+    home: Path | None = None
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home()) / "hermes-agent"
+    except Exception:
+        home = Path.home() / ".hermes" / "hermes-agent"
+    try:
+        if home.exists():
+            for init in sorted(home.glob("**/plugins/platforms/feishu/__init__.py"))[:1]:
+                return init.parent
+            for init in sorted(home.glob("**/feishu/__init__.py"))[:1]:
+                if "platforms" in str(init):
+                    return init.parent
+    except OSError:
         pass
 
     for root in candidates:
@@ -125,6 +143,86 @@ class _RegistrationRecorder:
         return _noop
 
 
+def _static_platform_kwargs() -> Optional[dict[str, Any]]:
+    """静态兜底：AST 读内置插件 ``register()`` 里的 ``ctx.register_platform(...)``。
+
+    动态录音要求 ``adapter.register(recorder)`` 能跑完；真实环境里它可能因为配置/环境
+    变化抛错。这里退一步只做静态解析——不执行声明体，字面量直接取值、``Name`` 用模块
+    命名空间解析（``FeishuAdapter``、检查函数等）。任何解析不了的表达式一律失败返回
+    None，**绝不猜准入字段**。
+    """
+    try:
+        root = _bundled_feishu_root()
+        source = (root / "__init__.py").read_text(encoding="utf-8", errors="replace")
+    except (ImportError, OSError):
+        return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    call_node: Optional[ast.Call] = None
+    class _Finder(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            nonlocal call_node
+            if node.name != "register" or call_node is not None:
+                return
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == "register_platform"):
+                    call_node = inner
+                    return
+    _Finder().visit(tree)
+    if call_node is None:
+        return None
+
+    try:
+        module = adapter_module()
+    except ImportError:
+        module = None
+
+    def _resolve(node: ast.AST) -> Any:
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return [_resolve(elt) for elt in node.elts]
+        if isinstance(node, ast.Name):
+            if module is None or not hasattr(module, node.id):
+                raise LookupError(node.id)
+            return getattr(module, node.id)
+        if isinstance(node, ast.Attribute):
+            base: Any = module
+            for part in _dotted(node).split("."):
+                if base is None or not hasattr(base, part):
+                    raise LookupError(part)
+                base = getattr(base, part)
+            return base
+        raise LookupError(type(node).__name__)
+
+    def _dotted(node: ast.Attribute) -> str:
+        parts = [node.attr]
+        cur = node.value
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+        return ".".join(reversed(parts))
+
+    kwargs: dict[str, Any] = {}
+    for kw in call_node.keywords:
+        if not kw.arg:      # **mapping：静态不可知
+            return None
+        try:
+            kwargs[kw.arg] = _resolve(kw.value)
+        except LookupError:
+            return None
+    if str(kwargs.get("name") or "") != "feishu" or "adapter_factory" not in kwargs:
+        return None
+    kwargs.pop("trusted_inbound", None)
+    return kwargs
+
+
 def recorded_platform_kwargs() -> Optional[dict[str, Any]]:
     """加载路径唯一入口：按文件加载内置插件并录下它的条目 kwargs（零锁、零注册表）。
 
@@ -136,12 +234,15 @@ def recorded_platform_kwargs() -> Optional[dict[str, Any]]:
         adapter.register(recorder)
     except Exception as exc:
         logger.warning("[lark-card] bundled feishu registration could not be recorded: %s", exc)
-        return None
+        static_kwargs = _static_platform_kwargs()
+        if static_kwargs is not None:
+            logger.info("[lark-card] 已改用静态解析 register_platform 声明（动态录音失败兜底）")
+        return static_kwargs
     matches = [k for k in recorder.platforms if k.get("name") == "feishu"]
     if len(matches) != 1:
         logger.warning("[lark-card] expected exactly one feishu platform declaration, got %d",
                        len(matches))
-        return None
+        return _static_platform_kwargs()
     kwargs = dict(matches[0])
     kwargs.pop("trusted_inbound", None)   # 永不豁免准入（公开 API 对 user 插件也会拒）
     return kwargs
