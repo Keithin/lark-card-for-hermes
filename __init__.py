@@ -58,6 +58,13 @@ try:
     from .hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
     from .hfc.interaction_input import InteractionInputError, parse_choice
     from .hfc.transient_notices import is_transient_busy_ack, transient_notice_recall_seconds
+    from .hfc.config_snapshot import LEDGER
+    from .hfc.diagnostics import DIAG
+    from .hfc.interaction_receipts import RECEIPTS, action_key
+    from .hfc.maintenance import GATE
+    from .hfc.metrics import METRICS
+    from .hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice
+    from .hfc.observed_rate import RATE
 except ImportError:  # 判据脚本按文件路径加载插件时没有包上下文
     sys.path.insert(0, str(Path(__file__).parent))
     from hfc.bridge import HfcTurnBridge, load_card_config
@@ -87,8 +94,38 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
     from hfc.feishu_ws_compat import _repaired_function as _ws_repaired_function
     from hfc.interaction_input import InteractionInputError, parse_choice
     from hfc.transient_notices import is_transient_busy_ack, transient_notice_recall_seconds
+    from hfc.config_snapshot import LEDGER
+    from hfc.diagnostics import DIAG
+    from hfc.interaction_receipts import RECEIPTS, action_key
+    from hfc.maintenance import GATE
+    from hfc.metrics import METRICS
+    from hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice
+    from hfc.observed_rate import RATE
 
 logger = logging.getLogger(__name__)
+
+# 运行态事实（供 /card-status、/card-doctor 读取；只在进程内，不落盘）
+_RUNTIME_STATE: dict[str, Any] = {"card_frame_repair": False, "registered": False, "hooks": 0}
+
+
+def _error_code(exc: BaseException) -> str:
+    """把异常里能定位的 HTTP 状态码抠出来（429/400 是我们最关心的两个）。"""
+    text = str(exc)
+    for code in ("429", "400", "403", "500", "502", "503"):
+        if code in text:
+            return f"HTTP {code}"
+    return type(exc).__name__
+
+
+def _plugin_version() -> str:
+    """plugin.yaml 里的版本号；读不到就返回 unknown（诊断里要能看出漏装）。"""
+    try:
+        for line in (Path(__file__).parent / "plugin.yaml").read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
 
 CARD_TITLE = "Hermes"
 ELEMENT_ID = "main"
@@ -712,6 +749,10 @@ def _build_adapter_class(base: Any) -> type:
                     source_event = state.get("event")
                     if not command or command not in SAFE_QUICK_COMMANDS or source_event is None:
                         return self._card_response()
+                    if not RECEIPTS.claim(action_key("center", center_id, command)):
+                        METRICS.inc("dedupe_hit")
+                        logger.info("[feishu-card] 命令中心重复复投已忽略: /%s", command)
+                        return self._card_response()
                     run_event = copy.copy(source_event)
                     run_event.text = f"/{command}"
                     if not self._submit_on_loop(loop, self.handle_message(run_event)):
@@ -756,6 +797,12 @@ def _build_adapter_class(base: Any) -> type:
                     return self._card_response()
                 except Exception:
                     pass   # 取不到待答项（已超时等）：沿用原值，不因此吞掉点击
+            # 幂等闸门：连点/回调重投只放行第一次，避免同一答案被提交两次
+            if not RECEIPTS.claim(action_key("clarify", clarify_id, choice)):
+                METRICS.inc("dedupe_hit")
+                logger.info("[feishu-card] clarify 重复点击已忽略: %s", clarify_id)
+                return self._card_response(self._clarify_receipt(
+                    clarify_id, f"其他…（请直接回复）" if not choice else str(choice), state))
             if not self._submit_on_loop(loop, self._resolve_clarify(
                     clarify_id=clarify_id, choice=choice, chat_id=state.get("chat_id", ""))):
                 return self._card_response()
@@ -809,6 +856,7 @@ def _build_adapter_class(base: Any) -> type:
             ok = await super().connect(is_reconnect=is_reconnect)
             if ok:
                 if _install_card_frame_repair():
+                    _RUNTIME_STATE["card_frame_repair"] = True
                     logger.info("[feishu-card] 已修复 lark-oapi 的 CARD 帧丢弃（卡片按钮回调可达）")
                 else:
                     # 补丁按函数体哈希匹配：lark-oapi 升级后会自动放弃。若新版 SDK 仍丢
@@ -885,12 +933,27 @@ def _build_adapter_class(base: Any) -> type:
         def _card_v2(self, chat_id: str, text: str, *, streaming: bool,
                      turn: Optional["Turn"] = None) -> dict:
             """卡片由 HFC 的 `render_card` 生成（显示模式与 HFC 同一份代码）；不可用时退回最小卡。"""
-            key = f"feishu:{chat_id}:{turn.thread_id}" if turn is not None else f"feishu:{chat_id}:"
+            base_key = (f"feishu:{chat_id}:{turn.thread_id}" if turn is not None
+                        else f"feishu:{chat_id}:")
             with _TURNS_LOCK:
                 # 回合外的发送（启动通知/cron/命令回复）不是本回合：按 notice 渲染并立即收尾，
                 # 否则新建的 session 收不到 complete，卡片永远停在「⏳ 执行中」。
                 live = turn is not None and not turn.final
-                _TURNS.answer_frame(key, text, create_notice=not live)
+                key = base_key
+                fresh = False
+                if turn is None:
+                    # turn is None 有两种：① 本回合终稿（正文与刚流式的内容同源）→ 必须复用
+                    # session，否则 duration/tokens 留在旧 session，底部只剩「已完成」；
+                    # ② 真·回合外通知（正文无关）→ 独立 notice session，不继承上一轮的 17s/↑867。
+                    prev = (_TURNS.answer_text(base_key) or "").strip()
+                    # notice_lifecycle：producer > 已知前缀 > 与上一轮正文同源
+                    same = (classify_notice(text, previous=prev) == TURN_FINAL) or (
+                        not prev and _TURNS.recent(base_key))
+                    if not same:
+                        key = f"feishu:{chat_id}:notice"
+                        fresh = True
+                        METRICS.inc("notice_card")
+                _TURNS.answer_frame(key, text, create_notice=not live, fresh=fresh)
                 card = _TURNS.render(key, streaming=streaming)
             if card:
                 body_len = next((len(el.get("content", "")) for el in
@@ -926,6 +989,7 @@ def _build_adapter_class(base: Any) -> type:
                     or _delivery_policy().decide(chat_id).disposition == NATIVE_DISPOSITION):
                 return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
             turn = self._turn_for(chat_id, metadata)
+            METRICS.inc("send")
             is_progress = MERGE_TOOL_CARD and looks_like_progress(formatted, self._tool_lines)
             logger.info("[feishu-card] send chat=%s turn=%s len=%d progress=%s known=%d",
                         chat_id, (turn.turn_id if turn else "-"), len(formatted), is_progress,
@@ -951,6 +1015,13 @@ def _build_adapter_class(base: Any) -> type:
             # 会被当成本回合第二次 send，直接改写上一条答复卡。
             if MERGE_TOOL_CARD and turn is not None and not turn.final:
                 existing = self._turn_card_id(chat_id, turn)
+                if existing and GATE.suppress_streaming():
+                    # 维护态：这次只更新 timeline，不发卡片编辑；终稿仍会正常投递
+                    METRICS.inc("maintenance_skip")
+                    _TURNS.answer_frame(self._bridge_key_for(chat_id, metadata),
+                                        "" if is_progress else formatted,
+                                        create_notice=False)
+                    return SendResult(success=True, message_id=existing)
                 if existing and self._cardkit is not None:
                     # 本回合已有卡：第二次 send 转成对同一张卡的更新（网关会 adopt 返回的 id）
                     try:
@@ -961,8 +1032,12 @@ def _build_adapter_class(base: Any) -> type:
                         # update() 返回 False = 飞书没接受这次变更：不能报成功
                         if not updated:
                             raise RuntimeError("cardkit update returned False")
+                        METRICS.inc("edit")
+                        RATE.observe()
                         return SendResult(success=True, message_id=existing)
                     except Exception as exc:
+                        METRICS.inc("edit_failed", code=_error_code(exc))
+                        DIAG.note_error("merged update", exc)
                         logger.warning("[feishu-card] merged card update failed, sending fresh: %s", exc)
                         self._turn_card.pop(chat_id, None)
             # 进度行只喂 timeline，正文那格留空给答复
@@ -987,12 +1062,16 @@ def _build_adapter_class(base: Any) -> type:
                             logger.error("[feishu-card] cardkit send outcome unknown, "
                                          "not falling back (would duplicate the card): %s", exc)
                             raise
+                        METRICS.inc("card_v1_fallback", code=_error_code(exc))
+                        DIAG.note_error("cardkit send", exc)
                         logger.warning("[feishu-card] cardkit send failed, using v1 card: %s", exc)
                 try:
                     result = await self._send_v1_card(chat_id, main, reply_to, metadata, turn=turn)
                     if result is not None:
                         return result
                 except Exception as exc:  # presentation must never break delivery
+                    METRICS.inc("text_fallback", code=_error_code(exc))
+                    DIAG.note_error("card send", exc)
                     logger.warning("[feishu-card] card send failed, using text: %s", exc)
             return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
 
@@ -1219,6 +1298,8 @@ def _on_card_preset(raw_args: str) -> str:
         return f"写入 config.json 失败：{exc}"
     with _TURNS_LOCK:
         _TURNS.config = load_card_config()
+        # 热加载后刷新快照，否则 /card-status 会把刚生效的键误报成「需重启」
+        LEDGER.capture(_TURNS.config)
     reply = f"✅ 卡片预设已切换到 {name}（已写入 config.json，下一条消息生效，无需重启）"
     _mark_command_reply("card-preset", reply)
     return reply
@@ -1282,9 +1363,84 @@ def _on_card_activity(raw_args: str) -> str:
         return f"写入 config.json 失败：{exc}"
     with _TURNS_LOCK:
         _TURNS.config = load_card_config()
+        # 热加载后刷新快照，否则 /card-status 会把刚生效的键误报成「需重启」
+        LEDGER.capture(_TURNS.config)
     reply = f"✅ 实时工具显示已切换到 {name}（已写入 config.json，下一条消息生效，无需重启）"
     _mark_command_reply("card-activity", reply)
     return reply
+
+
+# ── /card-status：运行态一眼看完（借鉴 HFC config_snapshot + diagnostics）───────────
+def _disk_config() -> dict:
+    try:
+        return load_card_config()
+    except Exception as exc:  # 配置坏了也要能看状态
+        logger.warning("[feishu-card] 读取 config.json 失败: %s", exc)
+        return {}
+
+
+def _status_facts() -> dict:
+    DIAG.register("plugin_version", _plugin_version)
+    DIAG.register("hooks", lambda: int(_RUNTIME_STATE.get("hooks") or 0))
+    DIAG.register("card_frame_repair", lambda: bool(_RUNTIME_STATE.get("card_frame_repair")))
+    return DIAG.collect()
+
+
+def _on_card_status(raw_args: str) -> str:
+    """``/card-status``：版本/hook/修补状态 + 投递计数 + 配置是否需重启。"""
+    try:
+        facts = _status_facts()
+        text = DIAG.render_text(facts, disk_config=_disk_config())
+    except Exception as exc:
+        logger.warning("[feishu-card] card-status 失败: %s", exc)
+        text = f"读取状态失败：{exc}"
+    _mark_command_reply("card-status", text)
+    return text
+
+
+def _on_card_doctor(raw_args: str) -> str:
+    """``/card-doctor``：导出脱敏支持报告（JSON），并给一行摘要。"""
+    try:
+        facts = _status_facts()
+        path = DIAG.write_support_report(facts)
+        metrics = facts.get("metrics", {}) or {}
+        counters = metrics.get("counters", {}) or {}
+        errors = metrics.get("errors", {}) or {}
+        text = (
+            f"🩺 支持报告已写出：`{path}`\n"
+            f"· 投递 send={counters.get('send', 0)} edit={counters.get('edit', 0)} "
+            f"fallback={counters.get('card_v1_fallback', 0)}\n"
+            f"· 接口错误={sum(errors.values())} · 维护态={'on' if (facts.get('maintenance') or {}).get('active') else 'off'}\n"
+            "· 报告已脱敏（token/secret/password 一律 REDACTED）"
+        )
+    except Exception as exc:
+        logger.warning("[feishu-card] card-doctor 失败: %s", exc)
+        text = f"生成支持报告失败：{exc}"
+    _mark_command_reply("card-doctor", text)
+    return text
+
+
+def _on_card_maintenance(raw_args: str) -> str:
+    """``/card-maintenance [on|off|status]``：维护态开关，只影响流式编辑，终稿照发。"""
+    arg = (raw_args or "").strip().lower()
+    try:
+        if arg in {"on", "start", "enter"}:
+            state = GATE.enter("manual")
+            text = "🛠 维护态已开启：跳过流式编辑（终稿仍投递），避免升级窗口期半坏卡"
+        elif arg in {"off", "stop", "exit"}:
+            state = GATE.exit()
+            text = f"✅ 维护态已关闭（本次共跳过 {state.get('suppressed', 0)} 次流式编辑）"
+        else:
+            state = GATE.snapshot()
+            text = (
+                f"维护态：{'**开启**' if state.get('active') else '关闭'}"
+                f" · 已跳过 {state.get('suppressed', 0)} 次\n用法：/card-maintenance <on|off|status>"
+            )
+    except Exception as exc:
+        logger.warning("[feishu-card] card-maintenance 失败: %s", exc)
+        text = f"维护态切换失败：{exc}"
+    _mark_command_reply("card-maintenance", text)
+    return text
 
 
 def _adapter_factory(base: Any) -> Any:
@@ -1326,6 +1482,29 @@ def register(ctx: Any) -> None:
             logger.error("[lark-card] register_platform(feishu) was refused; cards disabled")
     for hook_name, callback in _HOOKS:
         ctx.register_hook(hook_name, callback)
+    # 运行态事实：注册成功才置位，/card-status 与 /card-doctor 都读这里
+    _RUNTIME_STATE["registered"] = True
+    _RUNTIME_STATE["hooks"] = len(_HOOKS)
+    try:
+        LEDGER.capture(load_card_config())
+    except Exception as exc:  # 配置读不到不影响出卡
+        logger.warning("[feishu-card] 注册期配置快照失败: %s", exc)
+    DIAG.register("plugin_version", _plugin_version)
+    DIAG.register("hooks", lambda: int(_RUNTIME_STATE.get("hooks") or 0))
+    DIAG.register("card_frame_repair", lambda: bool(_RUNTIME_STATE.get("card_frame_repair")))
+    ctx.register_command(
+        "card-status", _on_card_status,
+        description="一次看完卡片运行态：版本/hook/修补/计数/配置是否需重启",
+    )
+    ctx.register_command(
+        "card-doctor", _on_card_doctor,
+        description="导出脱敏支持报告（排查卡片不显示/降级时用）",
+    )
+    ctx.register_command(
+        "card-maintenance", _on_card_maintenance,
+        description="维护态开关：升级窗口跳过流式编辑，终稿仍投递",
+        args_hint="<on|off|status>",
+    )
     ctx.register_command(
         "card-preset", _on_card_preset,
         description="切换飞书卡片阅读预设（classic/focused/detailed/task）",

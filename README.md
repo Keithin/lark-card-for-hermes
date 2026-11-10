@@ -28,6 +28,8 @@ This is a Hermes **platform plugin**. It overrides only the Feishu adapter's out
 - **Command cards** — slash-command feedback gets its own card: title by command, colour by outcome (green done / red failed / blue running / orange warning).
 - **Command center** — the `/commands` menu renders as a three-level card (overview → category → detail) whose buttons navigate categories, go back, or re-dispatch a command; metric commands such as `/status` render as result cards with metric columns.
 - **Switch commands** — `/card-preset` and `/card-activity` change the reading preset and the live tool-call display (`full` / `summary` / `hidden`) on the fly.
+- **Ops commands** — `/card-status` (version, hooks, lark-oapi CARD-frame repair, delivery counters/rates/error codes, click dedupe, maintenance state, config-drift), `/card-doctor` (writes a redacted support report to `~/.hermes/logs/lark-card-support-*.json`), `/card-maintenance <on|off|status>` (skip streaming edits during a Hermes upgrade window; final answers still delivered).
+- **Out-of-turn notices** — notices that belong to no turn (cron results, self-improvement reviews) get their own card and a clean footer; they no longer inherit the previous turn's duration/tokens.
 
 ### Why it does not break when Hermes upgrades
 
@@ -49,7 +51,7 @@ Even if upstream changes a private function we depend on, the failure mode is **
 
 ### Requirements
 
-- Hermes Agent **≥ 0.22** with a plugin system and hooks such as `post_gateway_admission` (tested on 0.23.x; `tests/run_all.py` 13/13 green)
+- Hermes Agent **≥ 0.22** with a plugin system and hooks such as `post_gateway_admission` (tested on 0.23.x; `tests/run_all.py` 14/14 green)
 - `lark-oapi` **1.6.8** — that version's `Client._handle_data_frame` silently drops CARD frames, which makes **card button clicks do nothing**. `hfc/feishu_ws_compat.py` matches that function body by AST hash and repairs it; on a version mismatch it declines automatically (`connect()` logs whether the repair was applied).
 
 ### Install
@@ -163,6 +165,8 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 - **命令卡**：斜杠命令的反馈用专门的卡——标题随命令、配色随结果（绿=完成 / 红=失败 / 蓝=进行中 / 橙=警告）。
 - **命令中心**：`/commands` 菜单渲染成三层卡（概览 → 分类 → 详情），按钮能跳分类、返回、复投命令；`/status` 这类指标命令渲染成带指标列的结果卡。
 - **切换命令**：`/card-preset`、`/card-activity` 随时切换阅读预设和实时工具调用显示（`full` / `summary` / `hidden`）。
+- **运维命令**：`/card-status`（版本、hooks、lark-oapi CARD 帧修补、投递计数/速率/错误码、点击去重、维护态、配置漂移）、`/card-doctor`（导出脱敏支持报告到 `~/.hermes/logs/lark-card-support-*.json`）、`/card-maintenance <on|off|status>`（升级窗口期跳过流式编辑，终稿照常投递）。
+- **回合外通知**：不属于任何回合的通知（定时任务结果、自我改进回顾）独立成卡、footer 干净，不再继承上一回合的耗时/token。
 
 ### 为什么不会因为 Hermes 升级而挂
 
@@ -184,7 +188,7 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 
 ### 依赖
 
-- 带插件系统和 `post_gateway_admission` 等 hooks 的 Hermes Agent **≥ 0.22**（0.23.x 上 `tests/run_all.py` 13/13 全绿）
+- 带插件系统和 `post_gateway_admission` 等 hooks 的 Hermes Agent **≥ 0.22**（0.23.x 上 `tests/run_all.py` 14/14 全绿）
 - `lark-oapi` **1.6.8** —— 该版本的 `Client._handle_data_frame` 会静默丢弃 CARD 帧，导致**卡片按钮点击无效**。`hfc/feishu_ws_compat.py` 用 AST 精确匹配那段函数体并修掉；版本不符会自动放弃（`connect()` 成功后日志会写明是否修复）。
 
 ### 安装
@@ -254,7 +258,7 @@ __init__.py          # 插件入口：公开 ctx.register_platform + 11 个 hook
 plugin.yaml          # 插件清单（插件 ID = catalog key = lark-card-for-hermes）
 turn_state.py        # 显式每回合注册表（替代进程级「当前回合」全局变量）
 compat/              # 内置 adapter 条目的薄兼容层（声明并测试支持范围）
-tests/               # 13 项行为判据（隔离 HERMES_HOME），run_all.py 一键全跑
+tests/               # 14 项行为判据（隔离 HERMES_HOME），run_all.py 一键全跑
 hfc/                 # HFC 渲染栈（MIT），原样复用
   bridge.py          #   ← 本项目新增：事件翻译层
   client.py          #   ← 本项目新增：最小 REST 通道

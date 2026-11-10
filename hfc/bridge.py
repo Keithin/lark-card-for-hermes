@@ -190,11 +190,17 @@ class HfcTurnBridge:
         self._apply(chat_id, "message.started",
                     {"reply_to_message_id": reply_to, "delivery_kind": delivery_kind})
 
-    def answer_frame(self, chat_id: str, cumulative: str, *, create_notice: bool = False) -> None:
+    def answer_frame(self, chat_id: str, cumulative: str, *, create_notice: bool = False,
+                     fresh: bool = False) -> None:
         """适配器拿到的是累积正文（可能带流式光标）；HFC 要的是增量。
 
         create_notice：回合外发送（通知/命令回复）自动建卡时按 notice 渲染并立即
         置 completed，否则 session 停在 thinking、没有 complete 事件，卡片永远「执行中」。
+
+        fresh：真正回合外的投递（turn is None）必须开新 session。否则同一 chat 键上
+        还留着的上一回 session 会被复用，通知卡于是继承了那一轮的 duration / tokens /
+        时间线，读起来像「同一条回复发了两遍」。回合内的收尾发送（turn.final）仍复用，
+        这样终稿落在同一张卡上，不会变两张。
         """
         if chat_id not in self._sessions:
             self.start(chat_id, delivery_kind="notice" if create_notice else "chat")
@@ -203,6 +209,12 @@ class HfcTurnBridge:
                 # 否则回合外通知永远顶着配置名（用户看到的「标题都是 Hermes」）。
                 self._sessions[chat_id].notice_title = notice_title(cumulative)
                 self.complete(chat_id)
+        elif fresh and create_notice:
+            # 调用方已判定这是“真·回合外通知”（正文与本回合无关），开新 session，
+            # 避免继承上一轮的 duration / tokens / 时间线。
+            self.start(chat_id, delivery_kind="notice")
+            self._sessions[chat_id].notice_title = notice_title(cumulative)
+            self.complete(chat_id)
         else:
             self._touch(chat_id)
         text = strip_cursor(cumulative or "")
@@ -282,6 +294,17 @@ class HfcTurnBridge:
     def answer_text(self, chat_id: str) -> str:
         session = self._sessions.get(chat_id)
         return session.answer_text if session is not None else ""
+
+    def recent(self, chat_id: str, *, seconds: float = 180.0) -> bool:
+        """这个键上的 session 是否刚刚活动过（用于分辨本回合终稿 / 真·回合外通知）。"""
+        session = self._sessions.get(chat_id)
+        if session is None:
+            return False
+        try:
+            updated = float(getattr(session, "updated_at", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return (time.time() - updated) <= seconds
 
 
 __all__ = ["HfcTurnBridge"]
