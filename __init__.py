@@ -490,6 +490,24 @@ def _chat_from_session_key(session_key: str) -> str:
     return tail if tail.startswith(("oc_", "on_")) else ""
 
 
+_HOOK_SEEN: set[str] = set()
+
+
+def _traced_hook(name: str, callback: Any) -> Any:
+    """首次触发的钩子打一条 INFO：网关到底有没有把事件派发给我们，一眼可验。"""
+    import functools
+
+    @functools.wraps(callback)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if name not in _HOOK_SEEN:
+            _HOOK_SEEN.add(name)
+            logger.info("[feishu-card] hook fired: %s", name)
+        METRICS.inc("hook:" + name)
+        return callback(*args, **kwargs)
+
+    return wrapper
+
+
 _TURN_MISS_LOG: dict[str, float] = {}
 _BIND_CONFLICT_LOG: dict[str, float] = {}
 
@@ -1592,7 +1610,7 @@ def register(ctx: Any) -> None:
         if handle is None:
             logger.error("[lark-card] register_platform(feishu) was refused; cards disabled")
     for hook_name, callback in _HOOKS:
-        ctx.register_hook(hook_name, callback)
+        ctx.register_hook(hook_name, _traced_hook(hook_name, callback))
     # 运行态事实：注册成功才置位，/card-status 与 /card-doctor 都读这里
     _RUNTIME_STATE["registered"] = True
     _RUNTIME_STATE["hooks"] = len(_HOOKS)
