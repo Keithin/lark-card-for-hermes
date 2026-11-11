@@ -491,6 +491,18 @@ def _chat_from_session_key(session_key: str) -> str:
 
 
 _TURN_MISS_LOG: dict[str, float] = {}
+_BIND_CONFLICT_LOG: dict[str, float] = {}
+
+
+def _note_bind_conflict(turn: Any, token: str) -> None:
+    """同一回合被别的 adapter 实例先绑定：告警但不降级（同 chat 60s 一条）。"""
+    chat_id = str(getattr(turn, "chat_id", "") or "")
+    now = time.monotonic()
+    if now - _BIND_CONFLICT_LOG.get(chat_id, 0.0) < 60.0:
+        return
+    _BIND_CONFLICT_LOG[chat_id] = now
+    logger.warning("[feishu-card] turn %s already bound by adapter %s (ours=%s) chat=%s — 仍按本回合处理",
+                   getattr(turn, "turn_id", "?"), getattr(turn, "adapter_token", "?"), token, chat_id or "<empty>")
 
 
 def _note_turn_miss(chat_id: str, thread_id: str) -> None:
@@ -504,9 +516,11 @@ def _note_turn_miss(chat_id: str, thread_id: str) -> None:
         active = [t for t in REGISTRY.active() if t.platform == "feishu"]
         snapshot = ", ".join(f"{t.chat_id or '<empty>'}/{t.thread_id or '-'}" for t in active) or "<none>"
     except Exception:
-        snapshot = "<unavailable>"
-    logger.warning("[feishu-card] turn lookup missed: chat=%s thread=%r active=[%s] — 该回合按通知卡处理",
-                   chat_id or "<empty>", thread_id, snapshot)
+        active, snapshot = [], "<unavailable>"
+    # 没有任何活动回合（启动通知、cron 推送）是正常情况，用 debug；有回合却对不上才是真问题
+    logger.log(logging.WARNING if active else logging.DEBUG,
+               "[feishu-card] turn lookup missed: chat=%s thread=%r active=[%s] — 该回合按通知卡处理",
+               chat_id or "<empty>", thread_id, snapshot)
 
 
 def _on_admission(platform: str = "", source: Any = None, session_key: str = "", **_kw: Any) -> None:
@@ -747,7 +761,10 @@ def _build_adapter_class(base: Any) -> type:
                 logger.debug("[feishu-card] turn matched by chat only (thread=%r)", thread_id)
                 turn = loose
             if not REGISTRY.bind_adapter(turn, self._adapter_token):
-                return None      # 已被另一个 adapter 实例持有：不接管、不串卡
+                # 另一个 adapter 实例先绑了这张回合。早期处理是 return None（不接管），
+                # 但那会把正常回复降级成「回合外通知」→ footer 丢掉耗时/token。
+                # 现在只记一条告警并继续按本回合处理：丢数字是必然代价，重复卡是概率事件。
+                _note_bind_conflict(turn, self._adapter_token)
             return turn
 
         @staticmethod
