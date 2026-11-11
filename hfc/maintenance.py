@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Callable
+from typing import Any
 
 
 class MaintenanceGate:
@@ -45,15 +45,6 @@ class MaintenanceGate:
                 return False
             self._suppressed += 1
             return True
-
-    def drain(self, flush: Callable[[], Any] | None = None) -> Any:
-        """维护态下的排空：只调一次在途刷新，不新建卡。"""
-        if flush is None:
-            return None
-        try:
-            return flush()
-        except Exception:
-            return None
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

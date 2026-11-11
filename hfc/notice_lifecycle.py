@@ -8,8 +8,6 @@
 """
 from __future__ import annotations
 
-from typing import Iterable
-
 TURN_FINAL = "turn_final"
 INDEPENDENT = "independent"
 
@@ -19,10 +17,6 @@ INDEPENDENT_PREFIXES: tuple[str, ...] = (
     "自我改进", "记忆", "定时任务", "任务完成", "系统通知", "后台任务",
 )
 
-# 明确属于「本回合」的 producer 名
-TURN_PRODUCERS = {"turn", "reply", "final", "stream", "assistant"}
-
-
 def _same_delivery(current: str, previous: str) -> bool:
     cur = (current or "").strip()
     prev = (previous or "").strip()
@@ -31,10 +25,23 @@ def _same_delivery(current: str, previous: str) -> bool:
     return cur == prev or cur.startswith(prev) or prev.startswith(cur)
 
 
-def classify(text: str, *, previous: str = "", producer: str | None = None) -> str:
+def same_delivery(current: str, previous: str, *, head: int = 40) -> bool:
+    """终稿 vs 流式正文的宽松同源判据：相等/互为前缀，或前 ``head`` 字相同。
+
+    只看前 N 字是为了挡住「终稿被 markdown 归一后与流式尾巴不一致」这种误判——
+    那会让一张正常的回合卡被当成通知卡，footer 只剩「已完成」。
+    """
+    if _same_delivery(current, previous):
+        return True
+    cur = (current or "").strip()
+    prev = (previous or "").strip()
+    if len(cur) < 20 or len(prev) < 20:
+        return False
+    return cur[:head] == prev[:head]
+
+
+def classify(text: str, *, previous: str = "") -> str:
     """返回 ``turn_final`` 或 ``independent``。"""
-    if producer and producer.strip().lower() in TURN_PRODUCERS:
-        return TURN_FINAL
     if _same_delivery(text, previous):
         return TURN_FINAL
     head = (text or "").strip()[:24]
@@ -44,8 +51,8 @@ def classify(text: str, *, previous: str = "", producer: str | None = None) -> s
     return INDEPENDENT
 
 
-def is_independent(text: str, *, previous: str = "", producer: str | None = None) -> bool:
-    return classify(text, previous=previous, producer=producer) == INDEPENDENT
+def is_independent(text: str, *, previous: str = "") -> bool:
+    return classify(text, previous=previous) == INDEPENDENT
 
 
 def describe(kind: str) -> str:

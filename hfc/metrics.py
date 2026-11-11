@@ -28,7 +28,7 @@ class CardMetrics:
             self._counters[name] += n
             if code is not None:
                 self._errors[str(code)] += n
-            for _ in range(min(n, 8)):
+            for _ in range(min(n, 32)):   # 单次调用最多记 32 个事件（批量只影响速率精度）
                 self._events.append((now, name))
 
     def rate(self, name: str | None = None, *, seconds: float | None = None) -> float:

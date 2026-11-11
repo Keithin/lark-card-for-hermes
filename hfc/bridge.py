@@ -43,9 +43,11 @@ SCHEMA_VERSION = "1"
 def _state_root() -> Path:
     override = os.environ.get("LARK_CARD_STATE_DIR")
     if override:
-        return Path(override).expanduser()
+        # resolve()：macOS 的 /var → /private/var 之类符号链接路径会被私有目录守卫拒绝，
+        # 归一化后再用，避免「静默不落盘 + 每 2 秒一条 warning」
+        return Path(override).expanduser().resolve()
     home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
-    return Path(home).expanduser() / "state" / "lark-card-for-hermes"
+    return (Path(home).expanduser() / "state" / "lark-card-for-hermes").resolve()
 
 
 STATE_DIR = _state_root()

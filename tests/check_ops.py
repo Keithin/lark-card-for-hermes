@@ -56,7 +56,7 @@ def check_notice_lifecycle():
     assert classify("结论：不追高，等待回踩。", previous="结论：不追高") == TURN_FINAL, "前缀超集也算同源"
     assert classify("💾 自我改进回顾：…") == INDEPENDENT
     assert classify("⚠️ 网关重启") == INDEPENDENT
-    assert classify("随便一句", producer="turn") == TURN_FINAL
+    assert classify("随便一句", previous="另一件完全无关的事情记录") == INDEPENDENT, "无同源证据就是独立卡"
     assert classify("随便一句", previous="完全不同") == INDEPENDENT
 
 
@@ -100,7 +100,7 @@ def check_diagnostics():
     assert facts["plugin_version"] == "1.7.7", facts
     assert str(facts["broken"]).startswith("<probe failed"), facts["broken"]
     text = diag.render_text(facts, disk_config={"card": {"tool_activity": "summary"}})
-    for token in ("运行态", "投递计数", "交互与维护", "配置"):
+    for token in ("运行态", "投递", "交互与维护", "配置"):
         assert token in text, token
     redacted = _redact_tree({"api_key": "sk-secret", "nested": {"token": "t0ken"}, "ok": 1})
     assert redacted["api_key"] == "[REDACTED]" and redacted["nested"]["token"] == "[REDACTED]"
@@ -111,9 +111,65 @@ def check_diagnostics():
         assert isinstance(payload, dict) and "metrics" in payload
 
 
+def check_notice_same_delivery():
+    """终稿被 markdown 归一后仍算「同源」，真通知不算——这是 footer 不丢 token 的保险丝。"""
+    from hfc.notice_lifecycle import classify, same_delivery, INDEPENDENT
+
+    head = "今天大盘缩量震荡沪指收在三千三百点附近量能比昨日萎缩百分之十二北向资金净流出三十七亿元"
+    tail = "明天重点看三千零五十一线支撑以及量能能否放大到八千亿以上"
+    streamed = head + "\n\n[工具] 查询完成\n\n" + tail
+    final = head + "\n\n" + tail                      # 终稿丢掉了流式里的工具插入段
+    assert classify(final, previous=streamed) == INDEPENDENT, "严格判据（相等/互为前缀）本身不应变宽"
+    assert same_delivery(final, streamed), "首 40 字相同 = 同源保险丝，避免误判成通知卡"
+    assert not same_delivery("💾 记忆已更新：3 条", streamed)
+    assert same_delivery("同一段正文", "同一段正文")
+    assert not same_delivery(head, "另一件完全无关的事情，长度也够二十个字以上了")
+
+
+def check_error_sanitised():
+    """异常原文进卡片/报告前必须脱敏（异常里常带含 token 的 URL）。"""
+    from hfc.diagnostics import Diagnostics
+
+    diag = Diagnostics()
+    diag.note_error("send", RuntimeError(
+        "HTTP 400 for https://open.feishu.cn/x?access_token=t-abcdef123456&a=1"), code=400)
+    item = diag.recent_errors(1)[0]
+    assert "t-abcdef123456" not in item["error"], item["error"]
+    assert len(item["error"]) <= 200
+
+
+def check_rate_peak_decays():
+    import time as _t
+    from hfc.observed_rate import ObservedRate
+
+    r = ObservedRate(window_seconds=0.25)
+    r.observe(n=3)
+    assert r.peak_per_second() >= 1
+    _t.sleep(0.3)
+    assert r.peak_per_second() == 0, "空闲超过窗口后峰值必须归零"
+
+
+def check_state_dir_resolves_symlink():
+    """状态目录落在符号链接下（macOS /var → /private/var）也要能落盘。"""
+    import shutil, json
+    from hfc.bridge import HfcTurnBridge
+
+    tmp = Path(tempfile.mkdtemp(prefix="lcf-state-"))
+    bridge = HfcTurnBridge("Hermes", store_dir=Path(tmp).resolve())
+    key = "feishu:stateprobe:"
+    bridge.start(key)
+    bridge.answer_frame(key, "检查点正文")
+    bridge.checkpoint(key, "om_state_probe")
+    files = list((Path(tmp).resolve() / "card-checkpoints-v1").glob("*.json"))
+    assert files, "检查点必须落盘"
+    assert json.loads(files[0].read_text())["record"]["message_id"] == "om_state_probe"
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     for fn in (check_receipts, check_config_snapshot, check_notice_lifecycle, check_metrics,
-               check_maintenance, check_rate, check_diagnostics):
+               check_maintenance, check_rate, check_diagnostics, check_notice_same_delivery,
+               check_error_sanitised, check_rate_peak_decays, check_state_dir_resolves_symlink):
         fn()
         print(f"ok {fn.__name__}")
     print("ops layer ok")

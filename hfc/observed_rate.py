@@ -16,6 +16,7 @@ class ObservedRate:
         self._events: deque[float] = deque(maxlen=max_events)
         self._window = float(window_seconds)
         self._peak = 0.0
+        self._peak_at = 0.0
 
     def observe(self, *, n: int = 1) -> float:
         now = time.time()
@@ -26,6 +27,7 @@ class ObservedRate:
             last_second = sum(1 for ts in self._events if ts >= cutoff)
             if last_second > self._peak:
                 self._peak = float(last_second)
+                self._peak_at = now
             cutoff_w = now - self._window
             recent = sum(1 for ts in self._events if ts >= cutoff_w)
         return recent / self._window
@@ -43,7 +45,10 @@ class ObservedRate:
             return sum(1 for ts in self._events if ts >= now - 1.0)
 
     def peak_per_second(self) -> float:
+        """窗口内峰值；超过一个窗口没活动就归零，避免「几天前的峰值」常驻。"""
         with self._lock:
+            if self._peak and time.time() - self._peak_at > self._window:
+                self._peak = 0.0
             return self._peak
 
     def snapshot(self) -> dict[str, float | int]:

@@ -66,7 +66,7 @@ try:
     from .hfc.interaction_receipts import RECEIPTS, action_key
     from .hfc.maintenance import GATE
     from .hfc.metrics import METRICS
-    from .hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice
+    from .hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice, same_delivery
     from .hfc.observed_rate import RATE
     from .hfc.preview import tool_preview as _local_tool_preview
 except ImportError:  # 判据脚本按文件路径加载插件时没有包上下文
@@ -106,7 +106,7 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
     from hfc.interaction_receipts import RECEIPTS, action_key
     from hfc.maintenance import GATE
     from hfc.metrics import METRICS
-    from hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice
+    from hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice, same_delivery
     from hfc.observed_rate import RATE
     from hfc.preview import tool_preview as _local_tool_preview
 
@@ -978,15 +978,21 @@ def _build_adapter_class(base: Any) -> type:
                 live = turn is not None and not turn.final
                 key = base_key
                 fresh = False
+                is_notice = False
                 if turn is None:
                     # turn is None 有两种：① 本回合终稿（正文与刚流式的内容同源）→ 必须复用
                     # session，否则 duration/tokens 留在旧 session，底部只剩「已完成」；
                     # ② 真·回合外通知（正文无关）→ 独立 notice session，不继承上一轮的 17s/↑867。
                     prev = (_TURNS.answer_text(base_key) or "").strip()
-                    # notice_lifecycle：producer > 已知前缀 > 与上一轮正文同源
-                    same = (classify_notice(text, previous=prev) == TURN_FINAL) or (
-                        not prev and _TURNS.recent(base_key))
-                    if not same:
+                    # ① 严格同源（相等/互为前缀）② 终稿被 markdown 归一后的宽松同源
+                    # ③ 没有正文但本键刚活动过（纯工具回合的收尾）。
+                    same = (
+                        classify_notice(text, previous=prev) == TURN_FINAL
+                        or same_delivery(text, prev)
+                        or (not prev and _TURNS.recent(base_key))
+                    )
+                    is_notice = not same
+                    if is_notice:
                         key = f"feishu:{chat_id}:notice"
                         fresh = True
                         METRICS.inc("notice_card")
@@ -996,7 +1002,8 @@ def _build_adapter_class(base: Any) -> type:
                 body_len = next((len(el.get("content", "")) for el in
                                  card.get("body", {}).get("elements", [])
                                  if el.get("element_id") == "main_content"), -1)
-                logger.info("[feishu-card] card_v2 text=%d rendered=%d", len(text or ""), body_len)
+                logger.info("[feishu-card] card_v2 text=%d rendered=%d notice=%d",
+                            len(text or ""), body_len, int(is_notice))
                 return card
             return base._card(_card_title(), "blue", text or " ")
 

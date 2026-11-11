@@ -33,6 +33,22 @@
 判据：`tests/check_compat.py`（6 组）——预览兜底、结构修补命中、already_ok、真干活分支不改写、
 静态平台声明、静态命令注册表。`run_all.py` 13 → **15** 项。
 
+## 自审后的收尾（1.7.11）
+
+随 P1/P2 一起修掉的 P2/P3：
+
+| 项 | 修法 |
+|---|---|
+| 终稿与流式正文不同源会误判成通知卡（footer 丢耗时/token） | 新增 `same_delivery()` 保险丝：首 40 字相同 + 本键 120s 内活动 → 视为终稿；`card_v2` 日志加 `notice=0/1` 便于事后核对 |
+| 未接线的死代码 | 删 `MaintenanceGate.drain()`、`TURN_PRODUCERS` / `classify(producer=)`（metadata 里根本没有 producer 字段） |
+| 未用 import | `diagnostics.format_diff`、`notice_lifecycle.Iterable` |
+| `/card-doctor` 与支持报告里的异常原文可能带 token | `note_error` 走 `_sanitize()`：核心脱敏器 + 本地 `access_token=/token:` 规则 + 200 字截断 |
+| `METRICS.inc("send")` 语义 | `/card-status` 文案改为「投递（send=尝试数，edit=成功编辑）」 |
+| 速率事件上限 8 条/次 | 提到 32 条/次 |
+| 峰值速率不衰减 | 超一个窗口无活动即归零 |
+| `LARK_CARD_STATE_DIR` 指向符号链接（如 TMPDIR）会静默不落盘 | 状态目录先 `resolve()` |
+| `.gitignore` 的 `state/` | 已冗余，删除 |
+
 ## 静态兜底的解析缺陷（1.7.11，自审发现）
 
 1.9 声称「动态录音失败 → AST 静态解析 register_platform」，实际是死代码：

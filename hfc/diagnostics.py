@@ -8,12 +8,13 @@ from __future__ import annotations
 import json
 import logging
 import platform
+import re
 import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
-from .config_snapshot import LEDGER, format_diff
+from .config_snapshot import LEDGER
 from .interaction_receipts import RECEIPTS
 from .maintenance import GATE
 from .metrics import METRICS
@@ -22,6 +23,26 @@ from .observed_rate import RATE
 logger = logging.getLogger("hermes_plugins.lark_card_for_hermes")
 
 _SENSITIVE_HINTS = ("token", "secret", "password", "api_key", "apikey", "cookie", "authorization")
+
+
+#: 核心脱敏器不覆盖的形态：URL 查询串 / ``key: value`` 形式的凭据
+_KEY_VALUE_SECRET_RE = re.compile(
+    r"(?i)\b(access[_-]?token|refresh[_-]?token|token|api[_-]?key|apikey|secret|password|passwd"
+    r"|authorization|cookie|session[_-]?id)(\s*[:=]\s*)([^\s&,;\"']+)")
+
+
+def _sanitize(text: str, *, limit: int = 200) -> str:
+    """异常文本进卡片/报告前先脱敏再截断：异常里常带完整 URL（含 access_token 参数）。"""
+    raw = str(text)
+    try:
+        from agent.redact import redact_sensitive_text
+        raw = redact_sensitive_text(raw, force=True)
+    except Exception:                     # 脱敏器不可用时靠下面的本地规则
+        pass
+    raw = _KEY_VALUE_SECRET_RE.sub(
+        lambda m: m.group(0) if m.group(3).startswith("***")
+        else f"{m.group(1)}{m.group(2)}***", raw)
+    return raw if len(raw) <= limit else raw[: limit - 1] + "…"
 
 
 class Diagnostics:
@@ -39,7 +60,7 @@ class Diagnostics:
         self._errors.append({
             "ts": time.strftime("%H:%M:%S"),
             "where": str(where),
-            "error": f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else str(exc),
+            "error": _sanitize(f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else str(exc)),
             "code": code,
         })
         METRICS.inc("diagnostic_error")
@@ -93,7 +114,7 @@ class Diagnostics:
         if fallbacks:
             lines.append("· 私有 import 降级：" + " · ".join(str(f) for f in fallbacks[:3]))
 
-        head("投递计数")
+        head("投递（send=尝试数，edit=成功编辑）")
         order = ("send", "edit", "card_v1_fallback", "text_fallback", "notice_card",
                  "dedupe_hit", "maintenance_skip")
         parts = [f"{k}={counters.get(k, 0)}" for k in order if counters.get(k, 0)]
@@ -119,7 +140,7 @@ class Diagnostics:
         if recent:
             head("最近错误")
             for item in recent[-3:]:
-                lines.append(f"· {item.get('ts')} {item.get('where')}: {str(item.get('error'))[:90]}")
+                lines.append(f"· {item.get('ts')} {item.get('where')}: {_sanitize(str(item.get('error')), limit=90)}")
         return "\n".join(lines)
 
     def write_support_report(self, facts: dict[str, Any] | None = None, *,
