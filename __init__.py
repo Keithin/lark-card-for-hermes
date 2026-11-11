@@ -1097,9 +1097,9 @@ def _build_adapter_class(base: Any) -> type:
             turn = self._turn_for(chat_id, metadata)
             METRICS.inc("send")
             is_progress = MERGE_TOOL_CARD and looks_like_progress(formatted, self._tool_lines)
-            logger.info("[feishu-card] send chat=%s turn=%s len=%d progress=%s known=%d",
+            logger.info("[feishu-card] send chat=%s turn=%s len=%d progress=%s known=%d meta=%s",
                         chat_id, (turn.turn_id if turn else "-"), len(formatted), is_progress,
-                        len(self._tool_lines))
+                        len(self._tool_lines), sorted((metadata or {}).keys()))
             # 斜杠命令的反馈不是回答：用 HFC 的命令卡（标题/配色随命令与结果）。
             command_card, _center_id = (None, "") if is_progress else _command_card(
                 formatted, chat_id, turn_live=turn is not None)
@@ -1217,8 +1217,9 @@ def _build_adapter_class(base: Any) -> type:
             if (MERGE_TOOL_CARD and message_id == self._turn_card_id(chat_id, turn)
                     and looks_like_progress(text, self._tool_lines)):
                 text = ""   # 进度帧只刷时间线：正文由 HFC session 自己保有
-            logger.info("[feishu-card] edit mid=%s len=%d finalize=%s blanked=%s",
-                        message_id, len(text), finalize, not text)
+            logger.info("[feishu-card] edit mid=%s len=%d finalize=%s blanked=%s turn=%s",
+                        message_id, len(text), finalize, not text,
+                        (turn.turn_id if turn else "-"))
             if self._cardkit is not None:
                 from gateway.platforms.base import SendResult
 
