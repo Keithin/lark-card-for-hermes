@@ -517,10 +517,8 @@ def _note_turn_miss(chat_id: str, thread_id: str) -> None:
         snapshot = ", ".join(f"{t.chat_id or '<empty>'}/{t.thread_id or '-'}" for t in active) or "<none>"
     except Exception:
         active, snapshot = [], "<unavailable>"
-    # 没有任何活动回合（启动通知、cron 推送）是正常情况，用 debug；有回合却对不上才是真问题
-    logger.log(logging.WARNING if active else logging.DEBUG,
-               "[feishu-card] turn lookup missed: chat=%s thread=%r active=[%s] — 该回合按通知卡处理",
-               chat_id or "<empty>", thread_id, snapshot)
+    logger.info("[feishu-card] turn lookup missed: chat=%s thread=%r active=[%s] — 按通知卡处理",
+                chat_id or "<empty>", thread_id, snapshot)
 
 
 def _on_admission(platform: str = "", source: Any = None, session_key: str = "", **_kw: Any) -> None:
@@ -533,8 +531,10 @@ def _on_admission(platform: str = "", source: Any = None, session_key: str = "",
         platform="feishu", session_key=str(session_key or ""),
         chat_id=chat_id, thread_id=thread_id,
     )
-    logger.debug("[feishu-card] turn registered id=%s chat=%s thread=%r session=%s",
-                 turn.turn_id, chat_id or "<empty>", thread_id, session_key)
+    # INFO 级：入站登记是回合归属的唯一来源，缺一条就等于「整回合被当通知卡」，
+    # 这条日志常驻（每消息一行）以便事后对账；确认稳定后可降为 debug。
+    logger.info("[feishu-card] admission platform=%r chat=%s thread=%r session=%s -> turn=%s",
+                platform, chat_id or "<empty>", thread_id, session_key, turn.turn_id)
     publish_canonical_turn_id(turn.turn_id)
     if turn.chat_id:
         with _TURNS_LOCK:
