@@ -11,6 +11,7 @@ HFC 原来靠源码 hook + sidecar 投递，这里的事件源是适配器自己
 
 from __future__ import annotations
 
+import copy
 import os
 
 import json
@@ -116,6 +117,12 @@ def strip_cursor(text: str) -> str:
         if not stripped.endswith(_CURSOR):
             return out
         out = stripped[: -len(_CURSOR)]
+
+
+_RENDER_OVERRIDE_FIELDS = frozenset({
+    "tool_activity", "show_reasoning", "stream_thinking_to_body",
+    "hide_completed_tool_activity",
+})
 
 
 class HfcTurnBridge:
@@ -332,13 +339,35 @@ class HfcTurnBridge:
         })
 
     # ── 渲染 ────────────────────────────────────────────────────────────────
+    def render_segment(self, chat_id: str, text: str, *, title: str = "") -> Optional[dict[str, Any]]:
+        """用同一会话的配置渲染一段正文（超限分段用）：不装下就返回 None。
+
+        克隆 session 而不是改 live 的那份：分段渲染是「试探 + 出图」，绝不能把
+        会话正文写坏（写坏了流式卡与 checkpoint 就跟着错）。
+        """
+        session = self._sessions.get(chat_id)
+        if session is None:
+            return None
+        clone = copy.deepcopy(session)
+        clone.answer_text = str(text or "")
+        config = self._config_for(chat_id)
+        result = render_card_result(
+            display_view(clone), title=str(title or config["title"]),
+            footer_fields=config["footer_fields"], **card_render_options(config))
+        if result.disposition != "card":
+            return None
+        return dict(result.card)
+
     def _config_for(self, chat_id: str) -> dict[str, Any]:
         """这个会话生效的卡片配置：全局配置 + 单 chat 显示覆盖（仅白名单字段）。"""
         overrides = self._chat_overrides_map.get(chat_id)
         if not overrides:
             return self.config
         effective = dict(self.config)
-        effective.update(overrides)
+        # chat_overrides 里混着非渲染键（suppressed_notice_kinds 等），只有显示字段能进
+        # card_render_options —— 否则会把未知参数塞进 render_card。
+        effective.update({key: val for key, val in overrides.items()
+                          if key in _RENDER_OVERRIDE_FIELDS})
         return effective
 
     def render(self, chat_id: str, *, streaming: bool) -> Optional[dict[str, Any]]:

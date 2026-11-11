@@ -54,6 +54,7 @@ try:
     from .hfc.config_rules import (
         CHAT_OVERRIDE_FIELDS, READING_PRESETS, TOOL_ACTIVITY_MODES,
         normalize_chat_overrides, normalize_reading_preset, normalize_tool_activity,
+        resolve_chat_overrides,
     )
     from .hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from .hfc.feishu_ws_compat import (
@@ -61,13 +62,19 @@ try:
         card_frame_repair_status as _ws_repair_status,
     )
     from .hfc.interaction_input import InteractionInputError, parse_choice
+    from .hfc.complete_notify import (
+        build_notify_text, elapsed_seconds, meets_threshold, normalize_min_duration_seconds,
+    )
+    from .hfc.segmentation import plan_segments, segment_delivery_key, segment_title
     from .hfc.transient_notices import is_transient_busy_ack, transient_notice_recall_seconds
     from .hfc.config_snapshot import LEDGER
     from .hfc.diagnostics import DIAG
     from .hfc.interaction_receipts import RECEIPTS, action_key
     from .hfc.maintenance import GATE
     from .hfc.metrics import METRICS
-    from .hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice, same_delivery
+    from .hfc.notice_lifecycle import (
+        TURN_FINAL, classify as classify_notice, notice_kind_for, same_delivery,
+    )
     from .hfc.observed_rate import RATE
     from .hfc.preview import tool_preview as _local_tool_preview
 except ImportError:  # 判据脚本按文件路径加载插件时没有包上下文
@@ -94,6 +101,7 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
     from hfc.config_rules import (
         CHAT_OVERRIDE_FIELDS, READING_PRESETS, TOOL_ACTIVITY_MODES,
         normalize_chat_overrides, normalize_reading_preset, normalize_tool_activity,
+        resolve_chat_overrides,
     )
     from hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from hfc.feishu_ws_compat import (
@@ -101,13 +109,19 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
         card_frame_repair_status as _ws_repair_status,
     )
     from hfc.interaction_input import InteractionInputError, parse_choice
+    from hfc.complete_notify import (
+        build_notify_text, elapsed_seconds, meets_threshold, normalize_min_duration_seconds,
+    )
+    from hfc.segmentation import plan_segments, segment_delivery_key, segment_title
     from hfc.transient_notices import is_transient_busy_ack, transient_notice_recall_seconds
     from hfc.config_snapshot import LEDGER
     from hfc.diagnostics import DIAG
     from hfc.interaction_receipts import RECEIPTS, action_key
     from hfc.maintenance import GATE
     from hfc.metrics import METRICS
-    from hfc.notice_lifecycle import TURN_FINAL, classify as classify_notice, same_delivery
+    from hfc.notice_lifecycle import (
+        TURN_FINAL, classify as classify_notice, notice_kind_for, same_delivery,
+    )
     from hfc.observed_rate import RATE
     from hfc.preview import tool_preview as _local_tool_preview
 
@@ -230,6 +244,10 @@ _GROUP_CHAT_TYPES = frozenset({"group", "channel", "thread", "topic"})
 _P2P_CHAT_TYPES = frozenset({"dm", "p2p", "private", "direct", "single"})
 
 
+# 租户 user_id → open_id 的进程内缓存（上限 512，满了整体清空）
+_OPEN_ID_CACHE: dict[str, str] = {}
+
+
 def _over_limit_chats(adapter: Any) -> set[str]:
     """本 adapter 上「卡片装不下、正文待补发原生文本」的 chat 集合。"""
     flag = getattr(adapter, "_over_limit_chats", None)
@@ -248,7 +266,7 @@ def _delivery_chat_type(raw: Any) -> str:
     return ""
 
 
-def _chat_overrides(chat_id: str) -> dict[str, Any]:
+def _chat_overrides(chat_id: str, chat_type: str = "") -> dict[str, Any]:
     """这个 chat 的显示覆盖（上游 #492 的 card.chat_overrides）。
 
     只允许显示类字段（tool_activity / show_reasoning / stream_thinking_to_body /
@@ -266,7 +284,7 @@ def _chat_overrides(chat_id: str) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("[feishu-card] card.chat_overrides 配置无效，忽略单 chat 覆盖: %s", exc)
             _CHAT_OVERRIDES = {}
-    return dict(_CHAT_OVERRIDES.get(str(chat_id).strip(), {}))
+    return resolve_chat_overrides(_CHAT_OVERRIDES, str(chat_id).strip(), chat_type)
 
 
 def _delivery_policy() -> ChatDeliveryPolicy:
@@ -329,6 +347,44 @@ def _redact(text: str) -> str:
         return text
 
 
+# 后台进程的「id → 启动信息」小表：`process_manage` 的 wait/poll 只有 id 和参数，
+# 不记账的话卡片上只剩一行 `process_manage {"action":"wait",...}`，看不出在等什么。
+_BG_PROCS: dict[str, dict[str, Any]] = {}
+_BG_TOOLS = frozenset({"process_manage", "process", "manage_process"})
+
+
+def _bg_args(args: Any) -> dict[str, Any]:
+    return dict(args) if isinstance(args, dict) else {}
+
+
+def _bg_preview(args: Any) -> str:
+    """把 process_manage 的参数翻译成一句人话（等哪条命令、等了多久）。"""
+    data = _bg_args(args)
+    action = str(data.get("action") or "").strip().lower()
+    process_id = str(data.get("process_id") or data.get("id") or "").strip()
+    known = _BG_PROCS.get(process_id, {}) if process_id else {}
+    command = str(data.get("command") or known.get("command") or "").strip()
+    if action in {"wait", "poll", "log", "output"}:
+        label = f"后台 #{process_id}" if process_id else "后台进程"
+        started = known.get("started")
+        waited = f"（已 {int(time.monotonic() - started)}s）" if started else ""
+        target = _redact(command[:60]) if command else "命令未知"
+        return f"等待{label}{waited}：{target}"
+    if action == "list":
+        return "查看后台进程列表"
+    if action in {"kill", "terminate", "stop"}:
+        return f"结束后台 #{process_id}" if process_id else "结束后台进程"
+    return _redact(command[:60]) if command else _preview_raw(args)
+
+
+def _preview_raw(args: Any) -> str:
+    try:
+        from agent.display import build_tool_preview
+        return build_tool_preview("process_manage", args or {}, max_len=48) or ""
+    except Exception:
+        return _redact(_local_tool_preview("process_manage", args or {}, max_len=48))
+
+
 def _preview(tool_name: str, args: Any) -> str:
     """一行工具参数摘要（已脱敏）。
 
@@ -336,6 +392,11 @@ def _preview(tool_name: str, args: Any) -> str:
     该私有模块缺失/改名/返回空时，退回插件自带的 `hfc.preview.tool_preview`，
     这样时间线不会因为 Hermes 内部重构而整片失去参数预览。
     """
+    if str(tool_name or "").lower() in _BG_TOOLS:
+        try:
+            return _bg_preview(args)
+        except Exception:
+            pass
     try:
         from agent.display import build_tool_preview
 
@@ -670,18 +731,43 @@ def _on_admission(platform: str = "", source: Any = None, session_key: str = "",
     # 会话类型（group / p2p）决定 default_delivery 的取值；缺失时类型规则不生效，
     # 只保留单 chat 规则 —— 与上游 #492 一致。
     turn.chat_type = _delivery_chat_type(_source_field(source, "chat_type"))
+    # 完成通知的 @ 目标：open_id（ou_）优先，拿不到就用租户 user_id 现解析。
+    turn.notify_user_id = (_source_field(source, "open_id")
+                           or _source_field(source, "user_id")
+                           or _source_field(source, "user_id_alt"))
     # INFO 级：入站登记是回合归属的唯一来源，缺一条就等于「整回合被当通知卡」，
     # 这条日志常驻（每消息一行）以便事后对账；确认稳定后可降为 debug。
     logger.info("[feishu-card] admission platform=%r chat=%s thread=%r session=%s -> turn=%s",
                 platform, chat_id or "<empty>", thread_id, session_key, turn.turn_id)
     publish_canonical_turn_id(turn.turn_id)
     if turn.chat_id:
-        overrides = _chat_overrides(str(turn.chat_id))
+        overrides = _chat_overrides(str(turn.chat_id), turn.chat_type)
         with _TURNS_LOCK:
             _TURNS.start(_bridge_key(turn), overrides=overrides)
         if overrides:
             logger.info("[feishu-card] chat overrides applied chat=%s fields=%s",
                         turn.chat_id, sorted(overrides))
+
+
+def _remember_background_process(args: Any, result: Any) -> None:
+    """从 process_manage 的结果里捞出后台进程 id，配上启动命令给后续 wait 用。"""
+    data = _bg_args(args)
+    action = str(data.get("action") or "").strip().lower()
+    if action not in {"start", "shell", "run", "spawn", "exec", "wait"}:
+        return
+    text = result if isinstance(result, str) else json.dumps(
+        result if not isinstance(result, (int, float, bool, type(None))) else {}, ensure_ascii=False, default=str)
+    import re as _re
+    pattern = r"""(?:process_id|session_id)[\"'\s:=]+([A-Za-z0-9_.-]{2,64})"""
+    ids = _re.findall(pattern, str(text))
+    command = str(data.get("command") or "").strip()
+    if not ids:
+        return
+    now = time.monotonic()
+    for process_id in ids[:3]:
+        if process_id not in _BG_PROCS and len(_BG_PROCS) > 64:
+            _BG_PROCS.clear()
+        _BG_PROCS[process_id] = {"command": command, "started": now}
 
 
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, tool_call_id: str = "",
@@ -700,8 +786,13 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, tool_call_id: str =
 
 def _on_post_tool_call(tool_name: str = "", duration_ms: Any = 0, status: str = "",
                        tool_call_id: str = "", session_id: str = "", platform: str = "",
-                       **_kw: Any) -> None:
+                       args: Any = None, result: Any = None, **_kw: Any) -> None:
     ok = str(status).lower() not in {"error", "blocked", "cancelled", "canceled"}
+    if ok and str(tool_name or "").lower() in _BG_TOOLS:
+        try:
+            _remember_background_process(args, result)
+        except Exception as exc:      # 记账失败只影响预览文案，绝不影响投递
+            logger.debug("[feishu-card] background process bookkeeping failed: %s", exc)
     turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id)
     if turn is None:
         return
@@ -743,6 +834,60 @@ def _on_subagent_stop(child_status: str = "", duration_ms: Any = 0, child_subage
                         duration=(duration_ms / 1000) if duration_ms else None)
 
 
+def _completion_notify_config() -> dict[str, Any]:
+    card = _plugin_config().get("card") or {}
+    notify = card.get("completion_notify") if isinstance(card, dict) else None
+    return dict(notify) if isinstance(notify, dict) else {}
+
+
+def _schedule_notify(coro_factory: Any) -> None:
+    """把通知投递丢给事件循环；没有 loop（判据脚本/同步调用）就静默跳过。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        loop.create_task(coro_factory())
+    except Exception as exc:
+        logger.warning("[feishu-card] completion notify schedule failed: %s", exc)
+
+
+def _maybe_notify_completion(turn: "Turn") -> None:
+    """轮次结束的推送：飞书 PATCH 卡片不产生新消息也不推送，只能另发一条。
+
+    - `placement` 必须是 `message`（`card` 本来就不推送，无需处理）；
+    - `min_duration_seconds` 门槛：0 = 每轮都推，缺省与旧行为一致；
+    - 耗时优先实测、缺失回退回合存活时长（上游实测 1/3 的记录 duration=0，
+      直接用会把最该通知的长任务全跳过）；
+    - 拿不到 `open_id` 时发不带 @ 的通知，绝不整条丢弃。
+    """
+    notify = _completion_notify_config()
+    if not notify.get("enabled"):
+        return
+    if str(notify.get("placement") or "card") != "message":
+        return
+    chat_id = str(turn.chat_id or "")
+    if not chat_id or turn.notified:
+        return
+    try:
+        threshold = normalize_min_duration_seconds(notify.get("min_duration_seconds"))
+    except ValueError as exc:
+        logger.warning("[feishu-card] completion_notify 配置无效，跳过通知: %s", exc)
+        return
+    elapsed = turn.elapsed()
+    if not meets_threshold(elapsed, threshold):
+        logger.info("[feishu-card] completion notify skipped turn=%s elapsed=%.1fs < %.0fs",
+                    turn.turn_id, elapsed, threshold)
+        return
+    adapter = _LIVE_ADAPTER
+    if adapter is None:
+        return
+    turn.notified = True
+    mention = bool(notify.get("mention")) if notify.get("mention") is not None else False
+    _schedule_notify(lambda: adapter.notify_completion(
+        chat_id, elapsed, mention=mention, user_id=turn.notify_user_id))
+
+
 def _on_session_end(platform: str = "", session_id: str = "", turn_id: str = "",
                     **_kw: Any) -> None:
     if platform and platform != "feishu":   # 别的平台（CLI/桌面）结束回合不能冻结飞书的回合
@@ -753,6 +898,7 @@ def _on_session_end(platform: str = "", session_id: str = "", turn_id: str = "",
     REGISTRY.end(turn)
     with _TURNS_LOCK:
         _TURNS.complete(_bridge_key(turn), duration=turn.elapsed(), **turn.usage)
+    _maybe_notify_completion(turn)
 
 
 def _on_stream_delta(delta: str = "", kind: str = "", session_id: str = "", platform: str = "",
@@ -1353,6 +1499,14 @@ def _build_adapter_class(base: Any) -> type:
             # chat_type 缺失时类型规则不生效，只留单 chat 规则。
             chat_type = str((turn.chat_type if turn is not None else "")
                             or (metadata or {}).get("chat_type") or "")
+            overrides = _chat_overrides(str(chat_id), chat_type)
+            suppressed = tuple(overrides.get("suppressed_notice_kinds") or ())
+            if suppressed:
+                kind = notice_kind_for(formatted)
+                if kind and kind in suppressed:
+                    METRICS.inc("notice_suppressed")
+                    logger.info("[feishu-card] notice suppressed kind=%s chat=%s", kind, chat_id)
+                    return SendResult(success=True)
             decision = _delivery_policy().decide(chat_id, chat_type=chat_type)
             if decision.disposition == NATIVE_DISPOSITION:
                 return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
@@ -1404,7 +1558,8 @@ def _build_adapter_class(base: Any) -> type:
                             raise RuntimeError("cardkit update returned False")
                         METRICS.inc("edit")
                         RATE.observe()
-                        await self._flush_over_limit(chat_id, formatted)
+                        await self._flush_over_limit(chat_id, formatted, turn=turn,
+                                                     message_id=existing)
                         return SendResult(success=True, message_id=existing)
                     except Exception as exc:
                         METRICS.inc("edit_failed", code=_error_code(exc))
@@ -1414,13 +1569,55 @@ def _build_adapter_class(base: Any) -> type:
             # 进度行只喂 timeline，正文那格留空给答复
             result = await self._send_card(chat_id, "" if is_progress else formatted, content,
                                            reply_to, metadata, turn=turn)
-            await self._flush_over_limit(chat_id, formatted)
             if result is not None and getattr(result, "message_id", ""):
                 self._remember_turn_card(chat_id, result.message_id, turn)
                 _TURNS.checkpoint(self._bridge_key_for(chat_id, metadata), result.message_id)
+            await self._flush_over_limit(
+                chat_id, formatted, turn=turn,
+                message_id=(getattr(result, "message_id", "") or ""))
             return result
 
-        async def _flush_over_limit(self, chat_id: str, content: str) -> None:
+        async def _deliver_segments(self, chat_id: str, content: str, *,
+                                    turn: Optional["Turn"] = None,
+                                    message_id: str = "") -> bool:
+            """主卡 + 编号续卡；任一步不可行返回 False（调用方回退原生文本）。"""
+            base_title = str((_TURNS.config or {}).get("title") or "Hermes Agent")
+            # bridge 的会话键是 feishu:{chat}:{thread}，不是裸 chat_id —— 传错键会
+            # 找不到 session，分段规划直接判不可行（静默退回原生文本）。
+            key = f"feishu:{chat_id}:{(turn.thread_id if turn else '')}"
+            plan = plan_segments(
+                content,
+                fits=lambda text: _TURNS.render_segment(key, text, title=base_title) is not None,
+            )
+            if plan is None:
+                logger.info("[feishu-card] segmentation not feasible, falling back to native")
+                return False
+            cards: list[dict] = []
+            for index, chunk in enumerate(plan.chunks):
+                card = _TURNS.render_segment(
+                    key, chunk, title=segment_title(base_title, index, plan.count))
+                if card is None:
+                    logger.info("[feishu-card] segment %d cannot be rendered, falling back", index)
+                    return False
+                cards.append(card)
+            for index, card in enumerate(cards):
+                if index == 0 and message_id and self._cardkit is not None:
+                    if not await self._cardkit.update(message_id, card):
+                        logger.info("[feishu-card] main segment patch rejected, falling back")
+                        return False
+                    continue
+                try:
+                    await self._transport().send(
+                        chat_id, card, delivery_uuid=segment_delivery_key(key, index))
+                except Exception as exc:
+                    logger.warning("[feishu-card] segment %d delivery failed: %s", index, exc)
+                    return False
+            logger.info("[feishu-card] delivered %d segment cards chat=%s", len(cards), chat_id)
+            return True
+
+        async def _flush_over_limit(self, chat_id: str, content: str, *,
+                                    turn: Optional["Turn"] = None,
+                                    message_id: str = "") -> None:
             """卡片装不下时把完整正文补发成原生文本。
 
             `render_card` 在超限时给的是一张「完整内容已切换为 Hermes 原生消息发送」的占位卡；
@@ -1431,6 +1628,16 @@ def _build_adapter_class(base: Any) -> type:
             if str(chat_id) not in flag or not str(content or "").strip():
                 return
             flag.discard(str(chat_id))
+            card_config = _plugin_config().get("card") or {}
+            mode = str(card_config.get("over_limit") or "native").strip().lower()
+            if mode == "segmented":
+                try:
+                    if await self._deliver_segments(chat_id, content, turn=turn,
+                                                    message_id=message_id):
+                        METRICS.inc("over_limit_segmented")
+                        return
+                except Exception as exc:
+                    logger.warning("[feishu-card] segmented delivery failed: %s", exc)
             METRICS.inc("over_limit_native")
             logger.warning("[feishu-card] card cannot hold answer, delivering native text: "
                            "chat=%s len=%d", chat_id, len(content))
@@ -1500,6 +1707,47 @@ def _build_adapter_class(base: Any) -> type:
                     chat_id, card, delivery_uuid=key, reply_to_message_id=None,
                 )
 
+        # ── 完成通知（completion_notify）────────────────────────────────────────
+        async def _open_id_for(self, user_id: str) -> str:
+            """租户 user_id → open_id（ou_）。解析失败返回空串：通知照发，只是不带 @。"""
+            key = str(user_id or "").strip()
+            if not key:
+                return ""
+            if key.startswith("ou_"):
+                return key
+            if key in _OPEN_ID_CACHE:
+                return _OPEN_ID_CACHE[key]
+            open_id = ""
+            try:
+                client = RestClient(self._app_id, self._app_secret,
+                                    domain=self._domain_name or "feishu")
+                token = await client._tenant_token()
+                data = await client._request_json(
+                    "GET", f"/contact/v3/users/{key}?user_id_type=user_id", token=token)
+                open_id = str(((data.get("data") or {}).get("user") or {}).get("open_id") or "")
+            except Exception as exc:
+                logger.info("[feishu-card] open_id resolve failed user=%s: %s", key, exc)
+            if open_id:
+                if len(_OPEN_ID_CACHE) > 512:
+                    _OPEN_ID_CACHE.clear()
+                _OPEN_ID_CACHE[key] = open_id
+            return open_id
+
+        async def notify_completion(self, chat_id: str, seconds: float, *,
+                                    mention: bool = True, user_id: str = "") -> bool:
+            """轮次结束补一条新消息：PATCH 卡片既不推送也不亮红点，只能另发。"""
+            open_id = await self._open_id_for(user_id) if mention else ""
+            try:
+                await super().send(chat_id, build_notify_text(seconds, open_id=open_id))
+                METRICS.inc("completion_notify")
+                logger.info("[feishu-card] completion notify chat=%s elapsed=%.1fs mention=%s",
+                            chat_id, seconds, bool(open_id))
+                return True
+            except Exception as exc:
+                METRICS.inc("completion_notify_failed")
+                logger.warning("[feishu-card] completion notify failed: %s", exc)
+                return False
+
         # ── edit ────────────────────────────────────────────────────────────────
         async def edit_message(
             self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
@@ -1522,7 +1770,8 @@ def _build_adapter_class(base: Any) -> type:
                         message_id, self._card_v2(chat_id, text, streaming=not finalize, turn=turn)
                     ):
                         _TURNS.checkpoint(f"feishu:{chat_id}:{(turn.thread_id if turn else '')}", message_id)
-                        await self._flush_over_limit(chat_id, text)
+                        await self._flush_over_limit(chat_id, text, turn=turn,
+                                                     message_id=message_id)
                         return SendResult(success=True, message_id=message_id)
                     logger.warning("[feishu-card] cardkit update returned False, falling back")
                 except Exception as exc:

@@ -282,3 +282,32 @@ tests/run_all.py = ALL PASS (15 checks)
 
 未做：`card.over_limit: segmented`（主卡 + 编号续卡，上游 #513）。当前回退到原生文本已保证不丢内容，
 分段卡是阅读体验优化，等确认需要再上。
+
+## A/B/C/D：完成推送、超限分段、通知抑制、后台等待详情（1.8.0）
+
+### A completion_notify（上游 #501/#502/#508）
+`hfc/complete_notify.py`（新）：`normalize_min_duration_seconds`（拒绝 bool/负数/非有限/超 86400）、
+`elapsed_seconds`（实测优先，缺则 `now - created_at`）、`meets_threshold`、`format_elapsed`、`build_notify_text`。
+插件侧：`_on_session_end` → `_maybe_notify_completion(turn)`；`placement` 必须 `message`；`turn.notified` 保证一轮一次；
+`_on_admission` 记 `Turn.notify_user_id`（open_id 优先，回落 user_id/user_id_alt）；
+adapter `notify_completion()` + `_open_id_for()`（`GET /contact/v3/users/{id}?user_id_type=user_id`，进程内缓存 512，
+失败即**无 @ 照发**）。判据：门槛/bool/耗时回退/两种文案。
+
+### B over_limit: segmented（上游 #511/#513）
+`hfc/segmentation.py`（新）：`plan_segments`（按 `scan_markdown_blocks` 的块边界贪心装箱，单块装不下或超 5 张 → None）、
+`segment_title`（「（2/3）」）、`segment_delivery_key`（`{key}:segment:{i}` 确定性幂等）。
+bridge：`render_segment(key, text, title)` 用 **deepcopy** 的会话重渲染（不污染 live session），
+装不下返回 None。插件 `_deliver_segments()`：逐张验证 → 主卡 PATCH 原消息、续卡走 transport 新发 →
+任一步失败返回 False，`_flush_over_limit` 回退原生文本。**bridge 键是 `feishu:{chat}:{thread}`，
+传裸 chat_id 会找不到 session 而静默退回原生文本**（踩过）。
+
+### C suppressed_notice_kinds（上游 #500）
+`config_rules.SUPPRESSIBLE_NOTICE_KINDS` + `chat_overrides` 新增该字段与 `group`/`p2p` 作用域键；
+`resolve_chat_overrides()`（类型先叠、精确 chat 后叠）。`notice_lifecycle.notice_kind_for()` 用生产者前缀
+把通知映射成类别（认不出返回空 = 不可抑制）。`send()` 在渲染前判定并**直接丢弃**（返回成功，不重试、不回落纯文本）。
+注意 `chat_type` 由 `_delivery_chat_type()` 归一（dm→p2p），所以规则要写在 `p2p`/`group` 下。
+
+### D 后台任务等待详情（上游 #361）
+`_remember_background_process()`（post_tool_call 带 `args`/`result`，从结果里捞 `process_id`）+
+`_bg_preview()`：wait/poll/log → `等待后台 #bash-3（已 12s）：python backtest.py`；list/kill 有专门文案；
+未登记的命令显示「命令未知」，绝不编造。

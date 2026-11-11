@@ -47,6 +47,9 @@ class Turn:
     trigger_message_id: str = ""
     # 会话类型（group / p2p）：决定 bindings.default_delivery 的取值。
     chat_type: str = ""
+    # 完成通知的 @ 目标（open_id 优先，缺则租户 user_id）；notified 保证一轮只推一次。
+    notify_user_id: str = ""
+    notified: bool = False
 
     @property
     def key(self) -> tuple[str, str]:

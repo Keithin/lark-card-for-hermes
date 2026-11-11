@@ -57,3 +57,33 @@ def is_independent(text: str, *, previous: str = "") -> bool:
 
 def describe(kind: str) -> str:
     return {"turn_final": "本回合终稿", "independent": "回合外通知"}.get(kind, kind)
+
+
+# ── 通知类别（供 card.chat_overrides.suppressed_notice_kinds 抑制）───────────────
+# 与 config_rules.SUPPRESSIBLE_NOTICE_KINDS 一一对应；只认「明确的生产者特征」，
+# 认不出来的一律返回空串 = 不可抑制（宁可多发，不可误杀正常回复）。
+_NOTICE_KIND_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("💾", "self-improvement"),
+    ("自我改进", "self-improvement"),
+    ("🧠", "memory"),
+    ("记忆", "memory"),
+    ("更新记忆", "memory"),
+    ("⏰", "cron"),
+    ("定时任务", "cron"),
+    ("定时", "cron"),
+    ("🧹", "system"),
+    ("系统通知", "system"),
+    ("后台任务", "background-task"),
+    ("任务完成", "background-task"),
+)
+
+
+def notice_kind_for(text: str) -> str:
+    """把通知正文映射成可抑制的类别名；无法判定返回 ``""``。"""
+    head = (text or "").strip()[:32]
+    if not head:
+        return ""
+    for prefix, kind in _NOTICE_KIND_PREFIXES:
+        if head.startswith(prefix):
+            return kind
+    return ""

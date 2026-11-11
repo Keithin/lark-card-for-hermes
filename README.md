@@ -130,6 +130,34 @@ hermes gateway restart
 - `card.chat_overrides`：只允许覆盖 `tool_activity`、`show_reasoning`、`stream_thinking_to_body`、
   `hide_completed_tool_activity` 四个显示字段，**在会话创建时固定**，进行中的卡片不会中途换外观；
   非法字段/取值在加载配置时报错。
+  另外可用 `"group"` / `"p2p"` 作为作用域键（类型覆盖先叠、精确 chat 最后叠），并新增
+  `suppressed_notice_kinds: [self-improvement | memory | cron | background-task | system]`
+  直接丢弃该类系统通知（不回落纯文本）。
+
+#### 完成推送（completion_notify）
+
+飞书对 PATCH 编辑不推送、不亮红点，所以「长任务跑完叫我」只能靠额外一条新消息：
+
+```json
+"card": { "completion_notify": { "enabled": true, "placement": "message",
+                                 "mention": true, "min_duration_seconds": 60 } }
+```
+
+- `min_duration_seconds`：0（默认）= 每轮都推；设 60 则只推 ≥60s 的轮次。
+- 耗时优先取实测；`message.completed` 缺 duration 时回退「现在 − 会话创建时刻」，
+  否则恰恰会把最该通知的长任务全部跳过。
+- 拿不到 `open_id` 时发**不带 @** 的通知（不会整条消失）。
+
+#### 超限策略（over_limit）
+
+```json
+"card": { "over_limit": "native" }      // 默认：占位卡 + 原生文本全文
+"card": { "over_limit": "segmented" }   // 主卡 + 编号续卡（最多 5 张）
+```
+
+卡片超过 28KB JSON / 200 元素 / 5 表时：`native` 发一张占位卡再把全文作为原生文本补发；
+`segmented` 则按 markdown 块边界无损切分，主卡承载开头（含 footer 统计与过程面板），
+续卡标题带「（2/3）」、每张单独验证装得下；任一环节不可行或投递失败 → 回退原生文本。
 
 ### 结构
 
@@ -284,6 +312,36 @@ Credentials reuse Hermes' existing Feishu configuration (environment variables o
 - `card.chat_overrides`: may only override `tool_activity`, `show_reasoning`, `stream_thinking_to_body`
   and `hide_completed_tool_activity`, fixed when the session is created (a running card never changes
   appearance mid-turn); unknown fields or values fail at load.
+  `"group"` / `"p2p"` are accepted as scope keys (chat-type rules merge first, the exact chat wins), and
+  `suppressed_notice_kinds: [self-improvement | memory | cron | background-task | system]` drops those
+  system notices outright (no plain-text fallback).
+
+#### Completion push (completion_notify)
+
+Feishu does not notify or badge on a PATCH-ed message, so "tell me when the long job finishes" needs a
+separate message:
+
+```json
+"card": { "completion_notify": { "enabled": true, "placement": "message",
+                                 "mention": true, "min_duration_seconds": 60 } }
+```
+
+- `min_duration_seconds`: `0` (default) notifies every turn; `60` notifies only turns that lasted ≥60s.
+- Elapsed time prefers the measured duration and falls back to `now - session created_at`, because a
+  missing duration would otherwise skip exactly the long turns this option exists for.
+- Without an `open_id` the notice is sent **without** a mention instead of being dropped.
+
+#### Over-limit policy (over_limit)
+
+```json
+"card": { "over_limit": "native" }      // default: placeholder card + full native text
+"card": { "over_limit": "segmented" }   // main card + numbered continuation cards (max 5)
+```
+
+Past 28KB JSON / 200 elements / 5 tables: `native` sends a placeholder card and then the full answer as
+native text; `segmented` splits losslessly on markdown block boundaries, keeps the opening (footer stats,
+process panel) on the main card, numbers continuations ("2/3") and verifies every card fits. Any
+impossible step or failed delivery falls back to native text.
 
 ### Layout
 
