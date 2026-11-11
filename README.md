@@ -29,6 +29,7 @@
 - **私有依赖全部有本地兜底**：工具参数预览、`ask_choice` 菜单、命令注册表、内置 feishu 平台的准入声明——任一 Hermes 内部模块改名/重构时自动降级到本地实现（日志与 `/card-status` 可见），不会整片失效；lark-oapi 的 CARD 帧修补改为「哈希精确匹配 + 结构匹配」双层，SDK 补丁版不再整段放弃。
 - **运维命令**：`/card-status`（版本、hooks、lark-oapi CARD 帧修补、投递计数/速率/错误码、点击去重、维护态、配置漂移）、`/card-doctor`（导出脱敏支持报告到 `~/.hermes/logs/lark-card-support-*.json`）、`/card-maintenance <on|off|status>`（升级窗口期跳过流式编辑，终稿照常投递）。
 - **回合外通知**：不属于任何回合的通知（定时任务结果、自我改进回顾）独立成卡、footer 干净，不再继承上一回合的耗时/token。
+- **回合串行收尾**：上一回合还没结束时你又发了新消息，旧回合的卡片会**立刻封口**（终态 + 「本轮已被新对话替代，任务尚未确认完成。」），新消息和它的卡排在后面 —— 不会出现「卡片还在跑、我的命令却排在它下面」的错位。开关：环境变量 `LARK_CARD_SEAL_ON_NEW_MESSAGE=0` 关闭该行为。
 
 ### 为什么不会因为 Hermes 升级而挂
 
@@ -169,6 +170,7 @@ This is a Hermes **platform plugin**. It overrides only the Feishu adapter's out
 - **Every private dependency has a local fallback** — tool-argument preview, `ask_choice` menus, the command registry and the bundled feishu platform declaration all degrade to in-tree implementations when a Hermes internal moves (visible in the log and in `/card-status`); the lark-oapi CARD-frame repair is now two-tier (exact body hash, then structural match) so SDK patch releases are no longer rejected wholesale.
 - **Ops commands** — `/card-status` (version, hooks, lark-oapi CARD-frame repair, delivery counters/rates/error codes, click dedupe, maintenance state, config-drift), `/card-doctor` (writes a redacted support report to `~/.hermes/logs/lark-card-support-*.json`), `/card-maintenance <on|off|status>` (skip streaming edits during a Hermes upgrade window; final answers still delivered).
 - **Out-of-turn notices** — notices that belong to no turn (cron results, self-improvement reviews) get their own card and a clean footer; they no longer inherit the previous turn's duration/tokens.
+- **Serialised turns** — if you send a new message while the previous turn is still running, the old card is sealed immediately (terminal state plus "本轮已被新对话替代，任务尚未确认完成。") so your message and its card come after it, instead of a live card sitting above your question. Opt out with `LARK_CARD_SEAL_ON_NEW_MESSAGE=0`.
 
 ### Why it does not break when Hermes upgrades
 

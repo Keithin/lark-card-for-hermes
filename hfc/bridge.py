@@ -287,6 +287,14 @@ class HfcTurnBridge:
             return
         self._apply(chat_id, "thinking.delta", {"text": text, "mode": mode})
 
+    def note(self, chat_id: str, text: str) -> None:
+        """给当前 session 的正文追加一段说明（封口旧回合时用，对齐 HFC 的替代文案）。"""
+        session = self._sessions.get(chat_id)
+        if session is None or not text:
+            return
+        body = (session.answer_text or "").rstrip()
+        session.answer_text = f"{body}\n\n{text}" if body else text
+
     def fail(self, chat_id: str, reason: str = "") -> None:
         """中断/失败 → message.failed，卡片走失败态而不是永远转圈。"""
         if chat_id not in self._sessions:

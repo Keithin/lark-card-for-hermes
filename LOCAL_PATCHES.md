@@ -178,3 +178,39 @@ footer = 已完成 · 10s · custom/cn:deepseek-v4.1-flash · ↑922 · ↓704 �
 tests/run_all.py = ALL PASS (15 checks)
 ```
 生效需用户在外部 shell 重启网关（插件跑在网关进程内，改文件不会自动重载）。
+
+## 回合串行收尾：新消息进来即封口旧回合（2026-11-11 第三轮）
+
+用户报「我发的命令跑到了插件卡片后面」。**不是消息排序错乱**：飞书按发送时间排，卡片位置在创建时就固定。
+真因是上一回合迟迟不收尾 —— 日志实测（2026-11-11）：
+
+```
+10:09:58  turn=9d9612ec 建卡（_interim_send）
+10:24:32  admission -> turn=07926773（用户发「mytdx运行状态」）
+10:24:36  send ... turn=9d9612ec len=275      ← 旧回合仍在活跃
+10:25:11  edit mid=...2264b8c finalize turn=07926773（1405 字终稿）
+```
+
+旧卡活了 932s（footer 15m32s），用户新消息只能排在它下面 ⇒ 看起来像「插件跑到命令前面」。
+
+上游 HFC 的做法（`hermes_feishu_card/server.py`）：`_abandon_stale_sessions_for_chat()`（4746/4843）
+在**同 chat 出现新 message.started 时**把旧 session `timeline.complete()` + `status=failed` +
+正文追加 `> 本轮已被新对话替代，任务尚未确认完成。`，再由
+`_schedule_abandoned_session_terminal_update()` 立刻把旧卡推成终态（日志 `Abandoning stale session …`）。
+即：卡片生命周期严格串行。
+
+本插件缺这一步，补齐四处：
+
+| 位置 | 改动 |
+|---|---|
+| `turn_state.py::supersede()`（新增） | 封口同 chat 全部未收尾回合并返回；`begin()` 替换同 key 回合时也一并 final（否则它继续参与 chat 匹配） |
+| `__init__.py::_seal_previous_turns()`（新增） | admission 里先封口再登记：`_TURNS.fail()` + `note(SEAL_NOTE)` + **同步** render 出终态卡（此刻 bridge 仍持有旧 session），网络更新丢给事件循环 |
+| `__init__.py::CardFeishuAdapter.seal_superseded_card()`（新增） | 用 `_turn_card[chat]` 里记录的旧消息 id 调 `cardkit.update()` 推终态；`_adapter_factory` 登记 `_LIVE_ADAPTER` 供 hooks 定位 |
+| `__init__.py::_turn_for()` | 显式 `metadata["turn_id"]` 优先（同 chat 并发两回合时不再靠 chat 猜） |
+
+开关：`LARK_CARD_SEAL_ON_NEW_MESSAGE=0` 关闭封口（默认开启）。文案 `SEAL_NOTE` 与 HFC 逐字一致。
+判据：`tests/check_seal.py`（5 组断言：supersede 语义、begin 同 key 收尾、封口卡含替代文案+已停止+保留正文、
+开关关闭不封口、真实 admission 后只剩一个 active），`run_all.py` = ALL PASS (16 checks)。
+
+已知代价：同 chat 真并发（用户连发两条）时前一条会**立刻**显示「已被新对话替代」并转失败态 ——
+与 HFC 行为一致；不能接受时用上面的环境变量关掉。

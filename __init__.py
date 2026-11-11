@@ -22,6 +22,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import sys
 import threading
 import uuid
@@ -539,12 +540,70 @@ def _note_turn_miss(chat_id: str, thread_id: str) -> None:
                 chat_id or "<empty>", thread_id, snapshot)
 
 
+SEAL_NOTE = "> 本轮已被新对话替代，任务尚未确认完成。"
+SEAL_ENV = "LARK_CARD_SEAL_ON_NEW_MESSAGE"
+# 当前活着的 adapter 实例（register/factory 时登记）。封口旧卡要走它持有的
+# message_id / cardkit transport，而 hooks 是模块级函数，所以必须留这个入口。
+_LIVE_ADAPTER: Any = None
+
+
+def _seal_enabled() -> bool:
+    raw = (os.environ.get(SEAL_ENV) or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
+def _seal_previous_turns(chat_id: str) -> None:
+    """入站即封口同 chat 的旧回合（对齐 HFC 的 ``_abandon_stale_sessions_for_chat``）。
+
+    为什么必须在 admission 里做：飞书按发送时间排序，卡片位置在创建时就固定。旧回合如果
+    还留在「执行中」，用户新发的那条消息只能排在它下面 —— 看起来就是「插件跑到命令前面」。
+
+    卡片内容在这里**同步**渲染成终态快照（此刻 `_TURNS` 还持有旧回合的 session，
+    一旦 begin() 建了新回合同一 chat key 的 session 就被替换），网络那一步才丢给事件循环。
+    """
+    if not chat_id or not _seal_enabled():
+        return
+    try:
+        superseded = REGISTRY.supersede(platform="feishu", chat_id=str(chat_id))
+    except Exception as exc:                      # 封口失败绝不能影响入站登记
+        logger.warning("[feishu-card] supersede failed: %s", exc)
+        return
+    adapter = _LIVE_ADAPTER
+    for old in superseded:
+        key = f"feishu:{chat_id}:{old.thread_id or ''}"
+        sealed: Optional[dict] = None
+        with _TURNS_LOCK:
+            try:
+                _TURNS.fail(key, "superseded")
+                _TURNS.note(key, SEAL_NOTE)
+                sealed = _TURNS.render(key, streaming=False)
+            except Exception as exc:
+                logger.warning("[feishu-card] seal render failed (turn=%s): %s", old.turn_id, exc)
+        logger.info("[feishu-card] superseded turn=%s chat=%s sealed=%s",
+                    old.turn_id, chat_id, bool(sealed))
+        if adapter is not None and sealed:
+            _schedule_seal(adapter, str(chat_id), old.turn_id, sealed)
+
+
+def _schedule_seal(adapter: Any, chat_id: str, turn_id: str, card: dict) -> None:
+    """把「更新旧卡」丢给事件循环；没有运行中的 loop（判据脚本）就静默跳过。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        loop.create_task(adapter.seal_superseded_card(chat_id, turn_id, card))
+    except Exception as exc:
+        logger.warning("[feishu-card] seal schedule failed: %s", exc)
+
+
 def _on_admission(platform: str = "", source: Any = None, session_key: str = "", **_kw: Any) -> None:
-    """一次入站消息 = 一个回合：注册新回合，并给 HFC 状态机开新 session。"""
+    """一次入站消息 = 一个回合：先封口同 chat 的旧回合，再注册新回合。"""
     if platform and platform != "feishu":
         return
     chat_id = _source_field(source, "chat_id") or _chat_from_session_key(session_key)
     thread_id = _source_field(source, "thread_id")
+    _seal_previous_turns(str(chat_id or ""))
     turn = REGISTRY.begin(
         platform="feishu", session_key=str(session_key or ""),
         chat_id=chat_id, thread_id=thread_id,
@@ -820,6 +879,17 @@ def _build_adapter_class(base: Any) -> type:
         def _turn_for(self, chat_id: str, metadata: Optional[dict] = None) -> Optional["Turn"]:
             """这个 chat/thread 是否属于本 adapter 的进行中回合（不是就返回 None）。"""
             thread_id = str((metadata or {}).get("thread_id") or "")
+            # 显式身份优先：payload 自带 turn_id 时不再靠 chat 猜。同 chat 并发两个回合
+            # （上一轮还没收尾又来新消息）时，chat 级匹配会把新回合的帧投进旧卡。
+            explicit_turn = str((metadata or {}).get("turn_id") or "")
+            if explicit_turn:
+                explicit = REGISTRY.by_turn_id(explicit_turn)
+                if explicit is not None and not explicit.final:
+                    if explicit.chat_id and str(explicit.chat_id) != str(chat_id or ""):
+                        return None
+                    if not REGISTRY.bind_adapter(explicit, self._adapter_token):
+                        _note_bind_conflict(explicit, self._adapter_token)
+                    return explicit
             turn = REGISTRY.for_chat(platform="feishu", chat_id=str(chat_id or ""), thread_id=thread_id)
             if turn is None:
                 adopted = REGISTRY.adopt(platform="feishu", chat_id=str(chat_id or ""),
@@ -1094,6 +1164,29 @@ def _build_adapter_class(base: Any) -> type:
             self._turn_card[chat_id] = ((turn.turn_id if turn else ""), message_id)
             if len(self._segments) > 128:  # ids/segments only matter for this process
                 self._segments.clear()
+
+        async def seal_superseded_card(self, chat_id: str, turn_id: str, card: dict) -> None:
+            """旧回合被新消息替代：把 admission 里渲染好的终态卡推到那张旧消息上。
+
+            卡片正文/状态已由 ``_seal_previous_turns`` 同步定稿（那一刻 bridge 还持有旧 session），
+            这里只负责「改那张已有消息」，所以不会被随后建立的新回合覆盖。
+            """
+            entry = self._turn_card.get(chat_id)
+            if not entry or entry[0] != turn_id:
+                return            # 这个回合没有合并卡（纯文本/命令卡/已被别的路径清掉）
+            message_id = entry[1]
+            self._turn_card.pop(chat_id, None)
+            if self._cardkit is None:
+                return
+            try:
+                updated = await self._cardkit.update(message_id, card)
+                if updated:
+                    METRICS.inc("seal_superseded")
+                logger.info("[feishu-card] sealed superseded card mid=%s turn=%s accepted=%s",
+                            message_id, turn_id, bool(updated))
+            except Exception as exc:
+                DIAG.note_error("seal superseded", exc)
+                logger.warning("[feishu-card] seal superseded card failed: %s", exc)
 
         # ── card shapes ─────────────────────────────────────────────────────────
         def _card_v1(self, chat_id: str, text: str, *, final: bool = False,
@@ -1636,7 +1729,11 @@ def _adapter_factory(base: Any) -> Any:
     adapter_class = _build_adapter_class(base)
 
     def build(config: Any) -> Any:
-        return adapter_class(config)
+        global _LIVE_ADAPTER
+        instance = adapter_class(config)
+        # 供 admission hook 封口旧回合时定位那张旧卡（hooks 是模块级函数，没有 self）。
+        _LIVE_ADAPTER = instance
+        return instance
 
     build.__name__ = "build_lark_card_adapter"
     return build

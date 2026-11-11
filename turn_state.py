@@ -66,6 +66,12 @@ class TurnRegistry:
               thread_id: str = "", turn_id: str = "") -> Turn:
         """一次入站消息 = 一个新回合；同 key 的旧回合（若还没收尾）被替换。"""
         with self._lock:
+            replaced = self._by_key.get((str(platform or ""), str(session_key or "")))
+            if replaced is not None and not replaced.final:
+                # 同 session 的旧回合必须一起收尾：留着 final=False 会继续参与 chat 匹配，
+                # 新回合的帧就可能被投进旧卡，旧卡也永远停在「执行中」。
+                replaced.final = True
+                replaced.ended_at = replaced.ended_at or time.monotonic()
             turn = Turn(platform=str(platform or ""), session_key=str(session_key or ""),
                         chat_id=str(chat_id or ""), thread_id=str(thread_id or ""),
                         turn_id=str(turn_id or uuid.uuid4().hex))
@@ -74,6 +80,32 @@ class TurnRegistry:
             self._order.append(turn.key)
             self._evict()
             return turn
+
+    def supersede(self, *, platform: str, chat_id: str, keep: str = "") -> list[Turn]:
+        """同 chat 未收尾的回合全部封口，返回被替代的回合（供调用方推终态卡）。
+
+        对齐 HFC sidecar 的 ``_abandon_stale_sessions_for_chat``：新消息一进来，上一回合的
+        卡片必须立刻转终态，否则飞书里那张卡会继续留在「执行中」，而用户的新消息排在它
+        下面（按发送时间排序），看起来就像「我的命令跑到卡片后面了」。
+        """
+        chat = str(chat_id or "")
+        if not chat:
+            return []          # 没有 chat 归属的回合（尚未被投递认领）不封口，避免误杀
+        with self._lock:
+            superseded: list[Turn] = []
+            now = time.monotonic()
+            for turn in list(self._by_key.values()):
+                if turn.final or turn.platform != platform:
+                    continue
+                if turn.turn_id == keep:
+                    continue
+                if str(turn.chat_id or "") != chat:
+                    continue
+                turn.final = True
+                turn.ended_at = turn.ended_at or now
+                superseded.append(turn)
+            return superseded
+
 
     def end(self, turn: Turn) -> None:
         with self._lock:

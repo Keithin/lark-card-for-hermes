@@ -54,3 +54,31 @@ assert "1. terminal" in v1_body and "完成" not in v1_body, v1_body
 assert "完成" in adapter._card_v1(CHAT, "正文", final=True, turn=TURN)["elements"][0]["content"]
 
 print("OK runtime: adapter builds, card JSON serializes, tool progress line redacted")
+
+
+# ── 回合封口：adapter 真的能把终态卡推到旧消息上（不联网，stub transport）────────
+import asyncio  # noqa: E402
+
+
+class _StubCardkit:
+    def __init__(self) -> None:
+        self.updates: list[tuple[str, dict]] = []
+
+    async def update(self, message_id: str, card: dict) -> bool:
+        self.updates.append((message_id, card))
+        return True
+
+
+seal_adapter = cls(PlatformConfig(enabled=True))
+seal_adapter._cardkit = _StubCardkit()
+seal_adapter._turn_card[CHAT] = ("turn-old", "om_old_msg")
+sealed_card = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "已停止"}]}}
+asyncio.run(seal_adapter.seal_superseded_card(CHAT, "turn-old", sealed_card))
+assert seal_adapter._cardkit.updates == [("om_old_msg", sealed_card)], seal_adapter._cardkit.updates
+assert CHAT not in seal_adapter._turn_card, "封口后没清掉回合卡记录"
+# 回合不匹配 → 什么都不做（别改别人的卡）
+seal_adapter._turn_card[CHAT] = ("turn-new", "om_new_msg")
+asyncio.run(seal_adapter.seal_superseded_card(CHAT, "turn-old", sealed_card))
+assert len(seal_adapter._cardkit.updates) == 1, "回合 id 不匹配时不该写卡"
+assert seal_adapter._turn_card[CHAT] == ("turn-new", "om_new_msg")
+print("OK runtime: seal_superseded_card 只改属于该回合的旧卡")
