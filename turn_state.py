@@ -42,6 +42,9 @@ class Turn:
     usage: dict[str, Any] = field(default_factory=lambda: {"tokens": {}, "model": "", "provider": "", "context": {}})
     adapter_token: str = ""
     session_id: str = ""
+    # 触发这个回合的入站消息 id（`post_gateway_admission` 的 message_id）。
+    # 用来把新卡挂成该消息的回复锚，避免「卡片在上、用户消息在下」的错位观感。
+    trigger_message_id: str = ""
 
     @property
     def key(self) -> tuple[str, str]:

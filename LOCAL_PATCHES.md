@@ -214,3 +214,19 @@ tests/run_all.py = ALL PASS (15 checks)
 
 已知代价：同 chat 真并发（用户连发两条）时前一条会**立刻**显示「已被新对话替代」并转失败态 ——
 与 HFC 行为一致；不能接受时用上面的环境变量关掉。
+
+## 新卡挂到触发消息上（reply 锚，2026-11-11 第四项）
+
+封口旧回合解决「旧卡压着新消息」，但还没解决「同一回合的卡与触发消息的相对位置」：
+飞书按发送时间排，卡片位置创建即固定。补一条 reply 锚 —— 新卡作为**触发它的那条用户消息的回复**投递。
+
+| 位置 | 改动 |
+|---|---|
+| `turn_state.py::Turn.trigger_message_id`（新增字段） | 记录 `post_gateway_admission` 顶层 `message_id`（不在 `source` 里） |
+| `__init__.py::_on_admission(message_id=…)` | 入站时写入 `turn.trigger_message_id` |
+| `__init__.py::CardFeishuAdapter._reply_anchor()` | 网关没给显式 `reply_to` 时用触发消息 id 兜底；回合外通知卡 / 未记 id 的回合不锚定 |
+| `send()` | 解析出 turn 后立刻套锚，并打进日志 `anchor=True/False` |
+| `_send_streaming_card()` | 自动补的锚失败时**去锚重试一次**（reply 锚只是排版优化，不能影响投递；显式 reply_to 失败仍抛出） |
+
+开关：`LARK_CARD_REPLY_ANCHOR=0`。判据：`tests/check_runtime.py`（锚取值优先级 / 开关 / 端到端传入 transport /
+失败降级），`check_seal.py`（admission 真的记下 message_id）。`run_all.py` = ALL PASS (16 checks)。

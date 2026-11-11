@@ -542,6 +542,9 @@ def _note_turn_miss(chat_id: str, thread_id: str) -> None:
 
 SEAL_NOTE = "> 本轮已被新对话替代，任务尚未确认完成。"
 SEAL_ENV = "LARK_CARD_SEAL_ON_NEW_MESSAGE"
+# 把新卡挂成「触发它的那条消息」的回复（reply 锚）。飞书按发送时间排序、卡片位置创建即固定，
+# 有了 reply 锚，卡片再也不会看起来排在用户消息前面。
+REPLY_ANCHOR_ENV = "LARK_CARD_REPLY_ANCHOR"
 # 当前活着的 adapter 实例（register/factory 时登记）。封口旧卡要走它持有的
 # message_id / cardkit transport，而 hooks 是模块级函数，所以必须留这个入口。
 _LIVE_ADAPTER: Any = None
@@ -549,6 +552,11 @@ _LIVE_ADAPTER: Any = None
 
 def _seal_enabled() -> bool:
     raw = (os.environ.get(SEAL_ENV) or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
+def _reply_anchor_enabled() -> bool:
+    raw = (os.environ.get(REPLY_ANCHOR_ENV) or "1").strip().lower()
     return raw not in {"0", "false", "no", "off", ""}
 
 
@@ -597,7 +605,8 @@ def _schedule_seal(adapter: Any, chat_id: str, turn_id: str, card: dict) -> None
         logger.warning("[feishu-card] seal schedule failed: %s", exc)
 
 
-def _on_admission(platform: str = "", source: Any = None, session_key: str = "", **_kw: Any) -> None:
+def _on_admission(platform: str = "", source: Any = None, session_key: str = "",
+                  message_id: str = "", **_kw: Any) -> None:
     """一次入站消息 = 一个回合：先封口同 chat 的旧回合，再注册新回合。"""
     if platform and platform != "feishu":
         return
@@ -608,6 +617,10 @@ def _on_admission(platform: str = "", source: Any = None, session_key: str = "",
         platform="feishu", session_key=str(session_key or ""),
         chat_id=chat_id, thread_id=thread_id,
     )
+    if message_id:
+        # 记住触发消息 id：投递侧用它把新卡挂成「回复」，飞书里就不会出现卡片在上、
+        # 用户消息在下的错位观感（见 _reply_anchor）。
+        turn.trigger_message_id = str(message_id)
     # INFO 级：入站登记是回合归属的唯一来源，缺一条就等于「整回合被当通知卡」，
     # 这条日志常驻（每消息一行）以便事后对账；确认稳定后可降为 debug。
     logger.info("[feishu-card] admission platform=%r chat=%s thread=%r session=%s -> turn=%s",
@@ -1148,6 +1161,19 @@ def _build_adapter_class(base: Any) -> type:
                 return str(canonical or turn.turn_id)
             return f"{chat_id}:{time.monotonic()}"
 
+        def _reply_anchor(self, reply_to: Optional[str], turn: Optional["Turn"]) -> Optional[str]:
+            """新卡的 reply 锚：挂到触发这个回合的那条用户消息上。
+
+            飞书只按发送时间排序、卡片位置在创建时固定，没有 reply 锚时「卡片在上、
+            我的命令在下」的观感无法避免（长回合尤其明显）。规则：
+            - 网关已经给了显式 reply_to（用户引用了某条消息）→ 用它的；
+            - 开关关闭（``LARK_CARD_REPLY_ANCHOR=0``）→ 不锚定，退回原行为；
+            - 回合没记到入站消息 id（API/工具钩子建的回合、通知卡）→ 不锚定。
+            """
+            if reply_to or turn is None or not _reply_anchor_enabled():
+                return reply_to
+            return turn.trigger_message_id or reply_to
+
         # ── 单卡合并（进度气泡 + 答复卡共用一张消息）─────────────────────────────
         def _turn_card_id(self, chat_id: str, turn: Optional["Turn"] = None) -> Optional[str]:
             """本回合属于这个 chat 的合并卡；回合变了就当没有。"""
@@ -1265,11 +1291,12 @@ def _build_adapter_class(base: Any) -> type:
                     or _delivery_policy().decide(chat_id).disposition == NATIVE_DISPOSITION):
                 return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
             turn = self._turn_for(chat_id, metadata)
+            reply_to = self._reply_anchor(reply_to, turn)     # 新卡挂到触发消息上
             METRICS.inc("send")
             is_progress = MERGE_TOOL_CARD and looks_like_progress(formatted, self._tool_lines)
-            logger.info("[feishu-card] send chat=%s turn=%s len=%d progress=%s known=%d meta=%s",
+            logger.info("[feishu-card] send chat=%s turn=%s len=%d progress=%s known=%d meta=%s anchor=%s",
                         chat_id, (turn.turn_id if turn else "-"), len(formatted), is_progress,
-                        len(self._tool_lines), sorted((metadata or {}).keys()))
+                        len(self._tool_lines), sorted((metadata or {}).keys()), bool(reply_to))
             # 斜杠命令的反馈不是回答：用 HFC 的命令卡（标题/配色随命令与结果）。
             command_card, _center_id = (None, "") if is_progress else _command_card(
                 formatted, chat_id, turn_live=turn is not None)
@@ -1372,10 +1399,21 @@ def _build_adapter_class(base: Any) -> type:
             """建卡与投递都交给 HFC 的 CardKitTransport：它按 delivery 键做幂等，一张回合一张卡。"""
             key = self._delivery_key(chat_id, turn)
             logger.info("[feishu-card] stream key=%s", key)
-            return await self._transport().send(
-                chat_id, self._card_v2(chat_id, text, streaming=True, turn=turn),
-                delivery_uuid=key, reply_to_message_id=reply_to,
-            )
+            card = self._card_v2(chat_id, text, streaming=True, turn=turn)
+            try:
+                return await self._transport().send(
+                    chat_id, card, delivery_uuid=key, reply_to_message_id=reply_to,
+                )
+            except Exception as exc:
+                # reply 锚只是排版优化，不能因为它把卡发不出去：自动补的锚失败时去掉重试一次。
+                auto_anchored = bool(reply_to) and turn is not None and \
+                    reply_to == (turn.trigger_message_id or None)
+                if not auto_anchored:
+                    raise
+                logger.warning("[feishu-card] reply anchor failed, retrying unanchored: %s", exc)
+                return await self._transport().send(
+                    chat_id, card, delivery_uuid=key, reply_to_message_id=None,
+                )
 
         # ── edit ────────────────────────────────────────────────────────────────
         async def edit_message(

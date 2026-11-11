@@ -112,10 +112,12 @@ print("OK seal: LARK_CARD_SEAL_ON_NEW_MESSAGE=0 时完全不封口")
 # ── 3. 真实入站登记：admission 里先封口再建新回合 ────────────────────────────
 mod.REGISTRY.begin(platform="feishu", session_key=SESSION + ":old", chat_id=CHAT)
 scheduled.clear()
-mod._on_admission(platform="feishu", source={"chat_id": CHAT}, session_key=SESSION + ":incoming")
+mod._on_admission(platform="feishu", source={"chat_id": CHAT},
+                  session_key=SESSION + ":incoming", message_id="om_trigger_msg")
 active = [t for t in mod.REGISTRY.active() if t.platform == "feishu"]
 assert len(active) == 1, f"入站后仍有多个活动回合: {[t.turn_id for t in active]}"
 assert active[0].session_key.endswith(":incoming")
+assert active[0].trigger_message_id == "om_trigger_msg", "admission 没记下触发消息 id（reply 锚要用）"
 assert scheduled and {c for c, _t, _card in scheduled} == {CHAT}, f"封口调度异常: {scheduled}"
 print("OK admission: 先封口旧回合，再登记新回合（只剩一个 active）")
 
