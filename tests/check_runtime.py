@@ -54,3 +54,123 @@ assert "1. terminal" in v1_body and "完成" not in v1_body, v1_body
 assert "完成" in adapter._card_v1(CHAT, "正文", final=True, turn=TURN)["elements"][0]["content"]
 
 print("OK runtime: adapter builds, card JSON serializes, tool progress line redacted")
+
+
+# ── 回合封口：adapter 真的能把终态卡推到旧消息上（不联网，stub transport）────────
+import asyncio  # noqa: E402
+
+
+class _StubCardkit:
+    def __init__(self) -> None:
+        self.updates: list[tuple[str, dict]] = []
+
+    async def update(self, message_id: str, card: dict) -> bool:
+        self.updates.append((message_id, card))
+        return True
+
+
+seal_adapter = cls(PlatformConfig(enabled=True))
+seal_adapter._cardkit = _StubCardkit()
+seal_adapter._turn_card[CHAT] = ("turn-old", "om_old_msg")
+sealed_card = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "已停止"}]}}
+asyncio.run(seal_adapter.seal_superseded_card(CHAT, "turn-old", sealed_card))
+assert seal_adapter._cardkit.updates == [("om_old_msg", sealed_card)], seal_adapter._cardkit.updates
+assert CHAT not in seal_adapter._turn_card, "封口后没清掉回合卡记录"
+# 回合不匹配 → 什么都不做（别改别人的卡）
+seal_adapter._turn_card[CHAT] = ("turn-new", "om_new_msg")
+asyncio.run(seal_adapter.seal_superseded_card(CHAT, "turn-old", sealed_card))
+assert len(seal_adapter._cardkit.updates) == 1, "回合 id 不匹配时不该写卡"
+assert seal_adapter._turn_card[CHAT] == ("turn-new", "om_new_msg")
+print("OK runtime: seal_superseded_card 只改属于该回合的旧卡")
+
+
+# ── reply 锚：新卡要挂到触发它的那条用户消息上 ────────────────────────────────
+from types import SimpleNamespace as _NS  # noqa: E402
+
+anchor_adapter = cls(PlatformConfig(enabled=True))
+_anchor_turn = _NS(turn_id="turn-anchor", trigger_message_id="om_trigger", thread_id="")
+assert anchor_adapter._reply_anchor(None, _anchor_turn) == "om_trigger", "未挂 reply 锚"
+assert anchor_adapter._reply_anchor("om_quoted", _anchor_turn) == "om_quoted", "显式 reply_to 应优先"
+assert anchor_adapter._reply_anchor(None, None) is None, "回合外的通知卡不该锚定"
+assert anchor_adapter._reply_anchor(None, _NS(turn_id="t", trigger_message_id="", thread_id="")) is None
+import os as _os  # noqa: E402
+
+_os.environ["LARK_CARD_REPLY_ANCHOR"] = "0"
+assert anchor_adapter._reply_anchor(None, _anchor_turn) is None, "开关关闭后仍锚定"
+del _os.environ["LARK_CARD_REPLY_ANCHOR"]
+print("OK runtime: reply 锚只在有触发消息时生效，显式 reply_to 优先，可开关关闭")
+
+
+# ── reply 锚真的进了投递层（不是只算出来）─────────────────────────────────────
+class _StubTransport:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send(self, chat_id, card, *, delivery_uuid=None, reply_to_message_id=None):
+        self.sent.append({"chat_id": chat_id, "uuid": delivery_uuid,
+                          "reply_to": reply_to_message_id, "card": card})
+        return _NS(success=True, message_id="om_card")
+
+
+tx = _StubTransport()
+tx_adapter = cls(PlatformConfig(enabled=True))
+tx_adapter._cardkit = tx
+asyncio.run(tx_adapter._send_streaming_card(CHAT, "正文", "om_trigger", {}, turn=None))
+assert tx.sent and tx.sent[0]["reply_to"] == "om_trigger", tx.sent
+print("OK runtime: _send_streaming_card 把 reply 锚传给了 transport")
+
+
+# ── reply 锚失败不能让卡片发不出去：自动降级为无锚重试一次 ────────────────────
+class _FlakyTransport:
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    async def send(self, chat_id, card, *, delivery_uuid=None, reply_to_message_id=None):
+        self.calls.append(reply_to_message_id)
+        if reply_to_message_id:
+            raise RuntimeError("reply target unavailable")
+        return _NS(success=True, message_id="om_card_unanchored")
+
+
+flaky = _FlakyTransport()
+flaky_adapter = cls(PlatformConfig(enabled=True))
+flaky_adapter._cardkit = flaky
+_anchor_turn2 = _NS(turn_id="turn-anchor2", trigger_message_id="om_trigger2", thread_id="",
+                    final=False)
+res = asyncio.run(flaky_adapter._send_streaming_card(CHAT, "正文", "om_trigger2", {},
+                                                     turn=_anchor_turn2))
+assert flaky.calls == ["om_trigger2", None], flaky.calls
+assert res.success and res.message_id == "om_card_unanchored"
+print("OK runtime: reply 锚失败自动无锚重试，卡片仍能发出")
+
+
+# ── reply 锚必须走飞书的 reply 端点（create 里塞 reply_message_id 会被静默忽略）────
+from hfc.client import RestClient  # noqa: E402
+
+
+class _RecordingRest(RestClient):
+    def __init__(self) -> None:
+        super().__init__("app", "secret", domain="feishu")
+        self.calls: list[tuple[str, str, dict]] = []
+
+    async def _tenant_token(self) -> str:          # 不联网
+        return "t-fake"
+
+    async def _request_json(self, method, path, *, token="", json_body=None):
+        self.calls.append((method, path, json_body or {}))
+        return {"data": {"message_id": "om_created"}}
+
+
+rest = _RecordingRest()
+asyncio.run(rest.send_card_delivery("oc_x", {"schema": "2.0"}, reply_to_message_id="om_trigger"))
+method, path, body = rest.calls[-1]
+assert method == "POST" and path == "/im/v1/messages/om_trigger/reply", (method, path)
+assert "receive_id" not in body and body["msg_type"] == "interactive", body
+assert body.get("reply_in_thread") is None, "默认不建话题串"
+assert json.loads(body["content"])["schema"] == "2.0"
+
+# 非法 id 不得拼进 path（退回普通发送）
+asyncio.run(rest.send_card_delivery("oc_x", {}, reply_to_message_id="../../evil"))
+assert rest.calls[-1][1] == "/im/v1/messages?receive_id_type=chat_id", rest.calls[-1]
+assert rest.calls[-1][2]["receive_id"] == "oc_x"
+print("OK runtime: reply 锚走 /im/v1/messages/<id>/reply，非法 id 退回普通发送")

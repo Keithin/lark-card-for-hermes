@@ -68,6 +68,9 @@ class SessionStore:
         if len(payload) > MAX_RECORD_BYTES:
             raise ValueError('checkpoint exceeds bound')
         self.prune()
+        # 目录被外部清掉（升级/手工清理）时自愈：检查点只是兜底，不能因为 ENOENT 反复告警
+        if not self.root.exists():
+            _prepare_private_root(self.root)
         path = self._path(key)
         if not path.exists() and len(list(self.root.glob('*.json'))) >= MAX_RECORDS:
             raise ValueError('checkpoint capacity reached')

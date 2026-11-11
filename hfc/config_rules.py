@@ -134,7 +134,9 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_tool_result_chars": 600,
         "table_overflow_mode": "compact",
         "native_tables": False,
-        "completion_notify": {"enabled": False},
+        "completion_notify": {"enabled": False, "min_duration_seconds": 0},
+        # 超限策略：native = 占位卡 + 原生文本全文（默认）；segmented = 主卡 + 编号续卡
+        "over_limit": "native",
         # Per-kind @ mention switches in interaction cards (clarify /
         # approval). The default is UNSET (None): the resolving helpers fall
         # back to the legacy global ``mentions_in_cards`` key (when present)
@@ -468,6 +470,11 @@ def normalize_card_config(value: object, *, path: str) -> None:
                 raw, f"{path}.interaction_mentions.{kind}"
             )
         value["interaction_mentions"] = normalized
+    if "over_limit" in value:
+        raw_mode = value["over_limit"]
+        if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in OVER_LIMIT_MODES:
+            raise ValueError(f"{path}.over_limit must be native or segmented")
+        value["over_limit"] = raw_mode.strip().lower()
     if "completion_notify" in value and isinstance(value["completion_notify"], dict):
         notify = value["completion_notify"]
         if "placement" in notify and (not isinstance(notify["placement"], str)
@@ -476,6 +483,12 @@ def normalize_card_config(value: object, *, path: str) -> None:
         if "mention" in notify and notify["mention"] is not None:
             notify["mention"] = normalize_boolean(
                 notify["mention"], f"{path}.completion_notify.mention"
+            )
+        if "min_duration_seconds" in notify:
+            from .complete_notify import normalize_min_duration_seconds
+            notify["min_duration_seconds"] = normalize_min_duration_seconds(
+                notify["min_duration_seconds"],
+                path=f"{path}.completion_notify.min_duration_seconds",
             )
 
 
@@ -523,3 +536,151 @@ def normalize_native_chats(
             seen.add(chat_id)
             normalized.append(chat_id)
     return normalized
+
+
+# ── 按会话类型/单 chat 的投递与显示覆盖（port of HFC #492）──────────────────────
+# 上游 v5.0.15 引入：群聊默认走原生文本、私聊走卡片；单 chat 仍是最高优先级；
+# `card.chat_overrides` 只允许覆盖显示类字段，避免把整份配置塞进单个会话。
+DELIVERY_MODES = ("card", "native")
+CHAT_TYPES = ("group", "p2p")
+OVER_LIMIT_MODES = ("native", "segmented")
+# 可以被按会话/按类型抑制的系统通知类别（来源：notice_lifecycle 的前缀分类）
+SUPPRESSIBLE_NOTICE_KINDS = (
+    "self-improvement",
+    "memory",
+    "cron",
+    "background-task",
+    "system",
+)
+CHAT_TYPE_SCOPES = ("group", "p2p")
+CHAT_OVERRIDE_FIELDS = (
+    "suppressed_notice_kinds",
+    "tool_activity",
+    "show_reasoning",
+    "stream_thinking_to_body",
+    "hide_completed_tool_activity",
+)
+_BOOLEAN_OVERRIDE_FIELDS = frozenset(
+    {"show_reasoning", "stream_thinking_to_body", "hide_completed_tool_activity"}
+)
+
+
+def normalize_delivery_mode(value: object, *, path: str = "bindings.default_delivery") -> str:
+    if not isinstance(value, str) or value.strip().lower() not in DELIVERY_MODES:
+        raise ValueError(f"{path} must be 'card' or 'native'")
+    return value.strip().lower()
+
+
+def normalize_default_delivery(
+    value: object, *, path: str = "bindings.default_delivery"
+) -> dict[str, str]:
+    """标量 ``card``/``native``，或 ``{group: native, p2p: card}``；返回 group/p2p/all。"""
+    resolved = {"all": "card", "group": "", "p2p": ""}
+    if value is None:
+        return resolved
+    if isinstance(value, str):
+        resolved["all"] = normalize_delivery_mode(value, path=path)
+        return resolved
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be 'card', 'native' or a mapping of chat types")
+    unknown = sorted(str(key) for key in value if str(key) not in CHAT_TYPES)
+    if unknown:
+        raise ValueError(f"{path} only accepts chat types: {', '.join(CHAT_TYPES)}")
+    for chat_type in CHAT_TYPES:
+        if chat_type in value:
+            resolved[chat_type] = normalize_delivery_mode(
+                value[chat_type], path=f"{path}.{chat_type}"
+            )
+    return resolved
+
+
+def normalize_chat_overrides(
+    value: object, *, path: str = "card.chat_overrides"
+) -> dict[str, dict[str, Any]]:
+    """``{chat_id | "group" | "p2p": {显示字段: 值}}``；键与取值都在白名单内，否则加载即报错。
+
+    允许三种键：精确 chat id、``group``（所有群）、``p2p``（所有私聊）。后两者是
+    upstream #500 的「按会话类型抑制/调整显示」，解析顺序在 `resolve_chat_overrides` 里：
+    类型作用域先叠，精确 chat 最后叠（chat id 优先级最高）。
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be a mapping of exact chat ids or chat types")
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_scope, raw_override in value.items():
+        if not isinstance(raw_scope, str) or not raw_scope.strip():
+            raise ValueError(f"{path} keys must be non-empty exact chat ids or chat types")
+        scope = raw_scope.strip()
+        if scope in CHAT_TYPE_SCOPES:
+            scope_path = f"{path}.{scope}"
+        else:
+            if len(scope) > _MAX_CHAT_ID_CHARS or any(
+                ord(character) < 32 or ord(character) == 127 for character in scope
+            ):
+                raise ValueError(f"{path}.{scope} must be a non-empty exact chat id")
+            scope_path = f"{path}.{scope}"
+        if not isinstance(raw_override, Mapping) or not raw_override:
+            raise ValueError(f"{scope_path} must be a non-empty mapping")
+        selected: dict[str, Any] = {}
+        for field_name, raw_value in raw_override.items():
+            field = str(field_name)
+            if field not in CHAT_OVERRIDE_FIELDS:
+                raise ValueError(
+                    f"{scope_path}.{field} is not overridable "
+                    f"(allowed: {', '.join(CHAT_OVERRIDE_FIELDS)})"
+                )
+            if field == "tool_activity":
+                mode = str(raw_value or "").strip().lower()
+                if mode not in TOOL_ACTIVITY_MODES:
+                    raise ValueError(
+                        f"{scope_path}.tool_activity must be "
+                        f"{' / '.join(TOOL_ACTIVITY_MODES)}"
+                    )
+                selected[field] = mode
+            elif field == "suppressed_notice_kinds":
+                if not isinstance(raw_value, (list, tuple)):
+                    raise ValueError(f"{scope_path}.suppressed_notice_kinds must be an array")
+                kinds: list[str] = []
+                for index, raw_kind in enumerate(raw_value):
+                    kind = str(raw_kind or "").strip().lower()
+                    if kind not in SUPPRESSIBLE_NOTICE_KINDS:
+                        raise ValueError(
+                            f"{scope_path}.suppressed_notice_kinds[{index}] must be one of "
+                            f"{', '.join(SUPPRESSIBLE_NOTICE_KINDS)}"
+                        )
+                    if kind not in kinds:
+                        kinds.append(kind)
+                selected[field] = kinds
+            else:
+                if not isinstance(raw_value, bool):
+                    raise ValueError(f"{scope_path}.{field} must be true or false")
+                selected[field] = raw_value
+        normalized[scope] = selected
+    return normalized
+
+
+def resolve_chat_overrides(
+    overrides: Mapping[str, Mapping[str, Any]] | None,
+    chat_id: str,
+    chat_type: str = "",
+) -> dict[str, Any]:
+    """类型作用域先叠、精确 chat 最后叠；`chat_type` 为空时只吃精确 chat 规则。"""
+    merged: dict[str, Any] = {}
+    if not overrides:
+        return merged
+    scope = str(chat_type or "").strip().lower()
+    if scope in CHAT_TYPE_SCOPES and isinstance(overrides.get(scope), Mapping):
+        merged.update(overrides[scope])
+    exact = overrides.get(str(chat_id or "").strip())
+    if isinstance(exact, Mapping):
+        merged.update(exact)
+    return merged
+
+
+def normalize_card_chats(value: object, *, path: str = "bindings.card_chats") -> list[str]:
+    """``bindings.card_chats``：类型默认走原生文本时，仍要出卡片的例外群。
+
+    校验规则与 ``native_chats`` 完全一致（精确 chat id、去重、禁通配），只是路径不同。
+    """
+    return normalize_native_chats(value, path=path)

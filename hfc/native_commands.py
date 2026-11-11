@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import ast
+import importlib.util
+import os
 import re
+import sys
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from .render import MAIN_CONTENT_CHUNK_CHARS
@@ -140,6 +146,95 @@ def _skill_command_entries() -> list[dict[str, Any]]:
     return result
 
 
+def _commands_source_path() -> Path | None:
+    """定位 ``hermes_cli/commands.py``：优先已导入模块，其次 find_spec，最后 HERMES_HOME。"""
+    module = sys.modules.get("hermes_cli")
+    base = None
+    if module is not None and getattr(module, "__file__", None):
+        base = Path(module.__file__).resolve().parent
+    else:
+        try:
+            spec = importlib.util.find_spec("hermes_cli")
+            if spec and spec.origin:
+                base = Path(spec.origin).resolve().parent
+        except (ImportError, ValueError, AttributeError):
+            base = None
+    if base is None:
+        home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+        candidate = Path(home) / "hermes-agent" / "hermes_cli"
+        base = candidate if candidate.exists() else None
+    if base is None:
+        return None
+    path = base / "commands.py"
+    return path if path.exists() else None
+
+
+@lru_cache(maxsize=1)
+def _static_registry_entries() -> list[dict[str, Any]]:
+    """静态兜底：AST 直读 ``COMMAND_REGISTRY`` 的 CommandDef 字面量。
+
+    只在 ``hermes_cli.commands`` 导入失败（缺依赖/半升级）时使用：不执行任何 Hermes
+    代码，因此不会因为内部重构把整张命令中心卡打成空白。拿不到的字段（配置门禁、
+    argument_mode）留空，命令本身仍可复选执行。
+    """
+    path = _commands_source_path()
+    if path is None:
+        return []
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return []
+    registry: list[ast.AST] | None = None
+    for node in ast.walk(tree):
+        targets: list[str] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target.id]          # ``COMMAND_REGISTRY: list[CommandDef] = [...]``
+            value = node.value
+        if "COMMAND_REGISTRY" in targets and isinstance(value, (ast.List, ast.Tuple)):
+            registry = list(value.elts)
+            break
+    if not registry:
+        return []
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for element in registry:
+        if not isinstance(element, ast.Call):
+            continue
+        positional = [ast.literal_eval(a) if isinstance(a, ast.Constant) else None
+                      for a in element.args]
+        keywords: dict[str, Any] = {}
+        for kw in element.keywords:
+            if kw.arg and isinstance(kw.value, ast.Constant):
+                keywords[kw.arg] = kw.value.value
+            elif kw.arg and isinstance(kw.value, (ast.Tuple, ast.List, ast.Set)):
+                try:
+                    keywords[kw.arg] = ast.literal_eval(kw.value)
+                except ValueError:
+                    continue
+        name = str(keywords.get("name") or (positional[0] if positional else "") or "").strip().lstrip("/")
+        if not name or name in seen:
+            continue
+        if keywords.get("cli_only") is True:
+            continue
+        seen.add(name)
+        entries.append({
+            "name": name,
+            "category": str(keywords.get("category") or (positional[2] if len(positional) > 2 and positional[2] else "Info")),
+            "description": str(keywords.get("description") or (positional[1] if len(positional) > 1 and positional[1] else f"Run /{name}")),
+            "args_hint": str(keywords.get("args_hint") or "").strip(),
+            "aliases": _bounded_strings(keywords.get("aliases") or (), 12),
+            "subcommands": _bounded_strings(keywords.get("subcommands") or (), 40),
+            "busy_policy": str(keywords.get("busy_policy") or "reject"),
+            "argument_mode": None,
+            "source": "core-static",
+        })
+    return entries
+
+
 def collect_hermes_command_catalog() -> list[dict[str, Any]]:
     """Read the live Hermes registry without importing gateway internals.
 
@@ -148,11 +243,22 @@ def collect_hermes_command_catalog() -> list[dict[str, Any]]:
     installs fail closed to an empty catalog so ordinary text feedback remains
     available.
     """
+    commands = None
     try:
         commands = _load_hermes_commands()
         registry = list(getattr(commands, "COMMAND_REGISTRY", ()) or ())
     except Exception:
-        return []
+        registry = []
+    if not registry:
+        # 私有模块缺失/半升级：静态读源码里的 COMMAND_REGISTRY，命令中心不至于整卡空白
+        core_entries = _static_registry_entries()
+        seen_static = {entry["name"] for entry in core_entries}
+        for entry in [*_plugin_command_entries(), *_skill_command_entries()]:
+            name = str(entry.get("name") or "")
+            if name and name not in seen_static:
+                core_entries.append(entry)
+                seen_static.add(name)
+        return core_entries
 
     try:
         config_gates = set(commands._resolve_config_gates())

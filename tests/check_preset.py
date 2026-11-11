@@ -76,6 +76,33 @@ assert GREEN_PILL in classic_footer, f"classic footer 缺状态胶囊: {classic_
 
 # task 的字号语义没被这次改动带坏（footer 仍是 notation 档）
 assert TASK_TEXT_SIZE_DEFAULTS.get("footer"), "TASK_TEXT_SIZE_DEFAULTS.footer 消失"
+
+# ── 2. task footer 不再吞掉「工具 #N」（local patch 2026-11-11）───────────────
+# 上游把工具数写成 `if session.tool_count and not compact`，task 预设 compact=True ⇒
+# 正常回复卡的 footer 完全没有工具调用次数，用户报「底栏少了一部分」。
+_tools_session = _completed_session()
+_tools_session._tool_call_count = 3
+assert "工具 #3" in _footer("task", _tools_session), "task footer 缺「工具 #N」"
+assert "工具 #3" in _footer("classic", _tools_session), "classic footer 缺「工具 #N」"
+
+# ── 3. footer 的 ctx 段（local patch 2026-11-11）─────────────────────────────
+# 渲染层要求 context 里有 used_tokens + max_tokens；数据侧由 _api_context 从
+# Hermes post_api_request 的 usage.prompt_tokens + 顶层 context_length 拼出来。
+_ctx_session = _completed_session()
+_ctx_session.context = {"used_tokens": 132000, "max_tokens": 1000000}
+_ctx_footer = _footer("task", _ctx_session)
+assert "ctx 132k/1m 13%" in _ctx_footer, f"task footer 缺 ctx 段: {_ctx_footer!r}"
+assert "ctx 132k/1m 13%" in _footer("classic", _ctx_session), "classic footer 缺 ctx 段"
+
+_api_context = mod._api_context
+assert _api_context({"prompt_tokens": 152986}, 1000000) == {"used_tokens": 152986, "max_tokens": 1000000}
+assert _api_context({"input_tokens": 900, "cache_read_tokens": 151000,
+                     "cache_write_tokens": 64}, 1000000) == {"used_tokens": 151964, "max_tokens": 1000000}
+assert _api_context({"prompt_tokens": 42, "context": {"used_tokens": 7, "max_tokens": 2048}}, 1000000) \
+    == {"used_tokens": 7, "max_tokens": 2048}, "上游已给的 context 必须优先"
+assert _api_context(None, None) is None
+print("OK render: task/classic 均带「工具 #N」与 ctx 段")
+
 print("OK render: task 有胶囊+模型色，classic 不回归")
 
 # ── 2. _write_preset 写盘语义 ────────────────────────────────────────────────

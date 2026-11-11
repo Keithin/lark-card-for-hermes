@@ -11,6 +11,9 @@ HFC 原来靠源码 hook + sidecar 投递，这里的事件源是适配器自己
 
 from __future__ import annotations
 
+import copy
+import os
+
 import json
 import logging
 import time
@@ -21,7 +24,7 @@ from typing import Any, Optional
 from .config_rules import DEFAULT_CONFIG, merge_card_config, normalize_card_config
 from .display_segments import display_view
 from .events import SidecarEvent
-from .render import render_card
+from .render import render_card_result
 from .render_options import card_render_options
 from .session import CardSession
 from .session_store import SessionStore
@@ -30,8 +33,25 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "1"
 
-# 卡片状态检查点：崩溃/重启后能把这它收尾，而不是留在「执行中」。
-STATE_DIR = Path(__file__).resolve().parent.parent / "state"
+# 卡片状态检查点：崩溃/重启后能把它们收尾，而不是留在「执行中」。
+#
+# 放在 HERMES_HOME 下而不是插件目录里，有两个原因：
+#   1. 插件目录可能被 `git clean -fdx` / 重装 / `hermes plugins update` 整体替换，
+#      运行时检查点不该跟着消失（否则网关崩了以后再没人收尾那张卡）；
+#   2. 检查点里含正文快照，`hermes plugins validate` 的安全扫描会把它们当成插件内容
+#      报 `destructive_home_rm` / `dump_all_env` 并判失败。
+# 可用 LARK_CARD_STATE_DIR 覆盖（测试/多实例用）。
+def _state_root() -> Path:
+    override = os.environ.get("LARK_CARD_STATE_DIR")
+    if override:
+        # resolve()：macOS 的 /var → /private/var 之类符号链接路径会被私有目录守卫拒绝，
+        # 归一化后再用，避免「静默不落盘 + 每 2 秒一条 warning」
+        return Path(override).expanduser().resolve()
+    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    return (Path(home).expanduser() / "state" / "lark-card-for-hermes").resolve()
+
+
+STATE_DIR = _state_root()
 CHECKPOINT_INTERVAL = 2.0   # 秒；每帧都落盘等于每帧一次磁盘写
 STALE_AFTER = 600.0         # 秒；比这更老的「执行中」检查点一定是上一个进程留下的
 
@@ -99,6 +119,12 @@ def strip_cursor(text: str) -> str:
         out = stripped[: -len(_CURSOR)]
 
 
+_RENDER_OVERRIDE_FIELDS = frozenset({
+    "tool_activity", "show_reasoning", "stream_thinking_to_body",
+    "hide_completed_tool_activity",
+})
+
+
 class HfcTurnBridge:
     """一个 chat 一个 HFC CardSession；正文按累积帧换算成 delta 喂进去。"""
 
@@ -107,11 +133,36 @@ class HfcTurnBridge:
         self.config = load_card_config()
         self._sessions: dict[str, CardSession] = {}
         self._pushed: dict[str, int] = {}   # chat -> 已经喂过的累积正文长度
+        # 单 chat 的显示覆盖（上游 #492 的 card.chat_overrides）：会话创建时固定，
+        # 只允许显示类字段，进行中的卡片不中途改外观。
+        self._overrides: dict[str, dict[str, Any]] = {}
         self._order: OrderedDict[str, None] = OrderedDict()   # LRU：最近用过的 chat 排最后
         self._seq = 0
         self._store_dir = Path(store_dir) if store_dir is not None else STATE_DIR
         self._store: Optional[SessionStore] = None
         self._checkpointed: dict[str, float] = {}   # chat -> 上次落盘的时刻
+
+    @property
+    def _disposition_map(self) -> dict[str, str]:
+        """chat -> 最近一次渲染的处置（card / native / deferred_native）。"""
+        mapping = getattr(self, "_dispositions", None)
+        if mapping is None:
+            mapping = {}
+            self._dispositions = mapping
+        return mapping
+
+    def last_disposition(self, chat_id: str) -> str:
+        """最近一次渲染是否还装得下：`native` = 卡片装不下，正文必须走原生文本。"""
+        return self._disposition_map.get(str(chat_id), "card")
+
+    @property
+    def _chat_overrides_map(self) -> dict[str, dict[str, Any]]:
+        """延迟初始化：测试/检查脚本会用 __new__ 造实例并手工塞属性。"""
+        mapping = getattr(self, "_overrides", None)
+        if mapping is None:
+            mapping = {}
+            self._overrides = mapping
+        return mapping
 
     def _touch(self, chat_id: str) -> None:
         """把 chat 标记为最近使用，超过 MAX_SESSIONS 时淘汰最久未用的会话状态。"""
@@ -180,8 +231,10 @@ class HfcTurnBridge:
             sequence=self._seq, created_at=time.time(), data=dict(data),
         ))
 
-    def start(self, chat_id: str, *, reply_to: str = "", delivery_kind: str = "chat") -> None:
+    def start(self, chat_id: str, *, reply_to: str = "", delivery_kind: str = "chat",
+              overrides: Optional[dict[str, Any]] = None) -> None:
         """一次入站消息 = 一个回合：新 session，时间线/正文归零。"""
+        self._chat_overrides_map[chat_id] = dict(overrides or {})
         self._sessions[chat_id] = CardSession(
             conversation_id=chat_id, message_id=f"turn-{chat_id}-{int(time.time() * 1000)}", chat_id=chat_id,
         )
@@ -190,11 +243,17 @@ class HfcTurnBridge:
         self._apply(chat_id, "message.started",
                     {"reply_to_message_id": reply_to, "delivery_kind": delivery_kind})
 
-    def answer_frame(self, chat_id: str, cumulative: str, *, create_notice: bool = False) -> None:
+    def answer_frame(self, chat_id: str, cumulative: str, *, create_notice: bool = False,
+                     fresh: bool = False) -> None:
         """适配器拿到的是累积正文（可能带流式光标）；HFC 要的是增量。
 
         create_notice：回合外发送（通知/命令回复）自动建卡时按 notice 渲染并立即
         置 completed，否则 session 停在 thinking、没有 complete 事件，卡片永远「执行中」。
+
+        fresh：真正回合外的投递（turn is None）必须开新 session。否则同一 chat 键上
+        还留着的上一回 session 会被复用，通知卡于是继承了那一轮的 duration / tokens /
+        时间线，读起来像「同一条回复发了两遍」。回合内的收尾发送（turn.final）仍复用，
+        这样终稿落在同一张卡上，不会变两张。
         """
         if chat_id not in self._sessions:
             self.start(chat_id, delivery_kind="notice" if create_notice else "chat")
@@ -203,6 +262,12 @@ class HfcTurnBridge:
                 # 否则回合外通知永远顶着配置名（用户看到的「标题都是 Hermes」）。
                 self._sessions[chat_id].notice_title = notice_title(cumulative)
                 self.complete(chat_id)
+        elif fresh and create_notice:
+            # 调用方已判定这是“真·回合外通知”（正文与本回合无关），开新 session，
+            # 避免继承上一轮的 duration / tokens / 时间线。
+            self.start(chat_id, delivery_kind="notice")
+            self._sessions[chat_id].notice_title = notice_title(cumulative)
+            self.complete(chat_id)
         else:
             self._touch(chat_id)
         text = strip_cursor(cumulative or "")
@@ -256,6 +321,14 @@ class HfcTurnBridge:
             return
         self._apply(chat_id, "thinking.delta", {"text": text, "mode": mode})
 
+    def note(self, chat_id: str, text: str) -> None:
+        """给当前 session 的正文追加一段说明（封口旧回合时用，对齐 HFC 的替代文案）。"""
+        session = self._sessions.get(chat_id)
+        if session is None or not text:
+            return
+        body = (session.answer_text or "").rstrip()
+        session.answer_text = f"{body}\n\n{text}" if body else text
+
     def fail(self, chat_id: str, reason: str = "") -> None:
         """中断/失败 → message.failed，卡片走失败态而不是永远转圈。"""
         if chat_id not in self._sessions:
@@ -266,14 +339,50 @@ class HfcTurnBridge:
         })
 
     # ── 渲染 ────────────────────────────────────────────────────────────────
+    def render_segment(self, chat_id: str, text: str, *, title: str = "") -> Optional[dict[str, Any]]:
+        """用同一会话的配置渲染一段正文（超限分段用）：不装下就返回 None。
+
+        克隆 session 而不是改 live 的那份：分段渲染是「试探 + 出图」，绝不能把
+        会话正文写坏（写坏了流式卡与 checkpoint 就跟着错）。
+        """
+        session = self._sessions.get(chat_id)
+        if session is None:
+            return None
+        clone = copy.deepcopy(session)
+        clone.answer_text = str(text or "")
+        config = self._config_for(chat_id)
+        result = render_card_result(
+            display_view(clone), title=str(title or config["title"]),
+            footer_fields=config["footer_fields"], **card_render_options(config))
+        if result.disposition != "card":
+            return None
+        return dict(result.card)
+
+    def _config_for(self, chat_id: str) -> dict[str, Any]:
+        """这个会话生效的卡片配置：全局配置 + 单 chat 显示覆盖（仅白名单字段）。"""
+        overrides = self._chat_overrides_map.get(chat_id)
+        if not overrides:
+            return self.config
+        effective = dict(self.config)
+        # chat_overrides 里混着非渲染键（suppressed_notice_kinds 等），只有显示字段能进
+        # card_render_options —— 否则会把未知参数塞进 render_card。
+        effective.update({key: val for key, val in overrides.items()
+                          if key in _RENDER_OVERRIDE_FIELDS})
+        return effective
+
     def render(self, chat_id: str, *, streaming: bool) -> Optional[dict[str, Any]]:
         """HFC `render_card` 出卡片 JSON —— 参数走 HFC 自己的 `card_render_options` 边界。"""
         session = self._sessions.get(chat_id)
         if session is None:
             return None
-        card = dict(render_card(display_view(session), title=self.config["title"],
-                                footer_fields=self.config["footer_fields"],
-                                **card_render_options(self.config)))
+        config = self._config_for(chat_id)
+        result = render_card_result(display_view(session), title=config["title"],
+                                    footer_fields=config["footer_fields"],
+                                    **card_render_options(config))
+        # 超限处置必须传出去：只看 card 会把「装不下」错当成普通卡片，
+        # 结果用一张 400 字节的占位卡换掉整篇正文。
+        self._disposition_map[str(chat_id)] = str(result.disposition)
+        card = dict(result.card)
         config = card.setdefault("config", {})
         config["streaming_mode"] = bool(streaming)
         config.setdefault("update_multi", True)
@@ -282,6 +391,17 @@ class HfcTurnBridge:
     def answer_text(self, chat_id: str) -> str:
         session = self._sessions.get(chat_id)
         return session.answer_text if session is not None else ""
+
+    def recent(self, chat_id: str, *, seconds: float = 180.0) -> bool:
+        """这个键上的 session 是否刚刚活动过（用于分辨本回合终稿 / 真·回合外通知）。"""
+        session = self._sessions.get(chat_id)
+        if session is None:
+            return False
+        try:
+            updated = float(getattr(session, "updated_at", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return (time.time() - updated) <= seconds
 
 
 __all__ = ["HfcTurnBridge"]

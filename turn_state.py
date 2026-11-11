@@ -42,6 +42,14 @@ class Turn:
     usage: dict[str, Any] = field(default_factory=lambda: {"tokens": {}, "model": "", "provider": "", "context": {}})
     adapter_token: str = ""
     session_id: str = ""
+    # 触发这个回合的入站消息 id（`post_gateway_admission` 的 message_id）。
+    # 用来把新卡挂成该消息的回复锚，避免「卡片在上、用户消息在下」的错位观感。
+    trigger_message_id: str = ""
+    # 会话类型（group / p2p）：决定 bindings.default_delivery 的取值。
+    chat_type: str = ""
+    # 完成通知的 @ 目标（open_id 优先，缺则租户 user_id）；notified 保证一轮只推一次。
+    notify_user_id: str = ""
+    notified: bool = False
 
     @property
     def key(self) -> tuple[str, str]:
@@ -66,6 +74,12 @@ class TurnRegistry:
               thread_id: str = "", turn_id: str = "") -> Turn:
         """一次入站消息 = 一个新回合；同 key 的旧回合（若还没收尾）被替换。"""
         with self._lock:
+            replaced = self._by_key.get((str(platform or ""), str(session_key or "")))
+            if replaced is not None and not replaced.final:
+                # 同 session 的旧回合必须一起收尾：留着 final=False 会继续参与 chat 匹配，
+                # 新回合的帧就可能被投进旧卡，旧卡也永远停在「执行中」。
+                replaced.final = True
+                replaced.ended_at = replaced.ended_at or time.monotonic()
             turn = Turn(platform=str(platform or ""), session_key=str(session_key or ""),
                         chat_id=str(chat_id or ""), thread_id=str(thread_id or ""),
                         turn_id=str(turn_id or uuid.uuid4().hex))
@@ -74,6 +88,32 @@ class TurnRegistry:
             self._order.append(turn.key)
             self._evict()
             return turn
+
+    def supersede(self, *, platform: str, chat_id: str, keep: str = "") -> list[Turn]:
+        """同 chat 未收尾的回合全部封口，返回被替代的回合（供调用方推终态卡）。
+
+        对齐 HFC sidecar 的 ``_abandon_stale_sessions_for_chat``：新消息一进来，上一回合的
+        卡片必须立刻转终态，否则飞书里那张卡会继续留在「执行中」，而用户的新消息排在它
+        下面（按发送时间排序），看起来就像「我的命令跑到卡片后面了」。
+        """
+        chat = str(chat_id or "")
+        if not chat:
+            return []          # 没有 chat 归属的回合（尚未被投递认领）不封口，避免误杀
+        with self._lock:
+            superseded: list[Turn] = []
+            now = time.monotonic()
+            for turn in list(self._by_key.values()):
+                if turn.final or turn.platform != platform:
+                    continue
+                if turn.turn_id == keep:
+                    continue
+                if str(turn.chat_id or "") != chat:
+                    continue
+                turn.final = True
+                turn.ended_at = turn.ended_at or now
+                superseded.append(turn)
+            return superseded
+
 
     def end(self, turn: Turn) -> None:
         with self._lock:
@@ -122,6 +162,42 @@ class TurnRegistry:
                 if turn.chat_id == chat_id and (turn.thread_id or "") == (thread_id or ""):
                     return turn
             return None
+
+    def for_chat_loose(self, *, platform: str, chat_id: str) -> Optional[Turn]:
+        """严格 (chat, thread) 没命中时的兜底：同 chat 恰好一个活动回合就用它。
+
+        触发场景：回合登记时带了 thread_id，而投递侧 metadata 里没有（或反之），
+        严格匹配会判成「回合外」→ 正常回复被当通知卡，footer 丢掉耗时/token。
+        只在**唯一**候选时生效；多候选（同 chat 多线程并发）仍返回 None，不赌。
+        """
+        with self._lock:
+            hits = [t for t in self._by_key.values()
+                    if not t.final and t.platform == platform and t.chat_id == chat_id]
+            return hits[0] if len(hits) == 1 else None
+
+    def adopt(self, *, platform: str, chat_id: str, thread_id: str = "",
+              max_age: float = 900.0) -> Optional[Turn]:
+        """投递侧认领：**唯一**活动回合时把它和这个 chat 绑起来。
+
+        用途：`post_gateway_admission` 不派发时，回合由 API/工具钩子建立（只带
+        session_id，没有 chat_id）。投递侧只有 chat_id，两边靠「本平台只剩一个
+        活动回合」对接；一旦认领就补齐 chat_id/thread_id，后续严格匹配即可命中。
+        多回合并发 / 回合太旧 → 返回 None，不赌。
+        """
+        with self._lock:
+            now = time.monotonic()
+            candidates = [t for t in self._by_key.values()
+                          if not t.final and t.platform == platform
+                          and now - t.started <= max_age
+                          and (not t.chat_id or t.chat_id == chat_id)]
+            if len(candidates) != 1:
+                return None
+            turn = candidates[0]
+            if not turn.chat_id:
+                turn.chat_id = str(chat_id or "")
+            if thread_id and not turn.thread_id:
+                turn.thread_id = str(thread_id or "")
+            return turn
 
     def bind_adapter(self, turn: Turn, adapter_token: str) -> bool:
         """第一个给这个 chat 投递的 adapter 拥有该回合；别的实例不接管。"""

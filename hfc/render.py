@@ -2742,7 +2742,7 @@ def _render_footer(
         # mid-turn: the core only sends tokens with turn.completed, so an approval that fires
         # during the run legitimately shows no counts rather than a fake ↑0 ↓0).
         waiting: list[str] = []
-        if session.tool_count and not compact and tool_activity != "hidden":
+        if session.tool_count and tool_activity != "hidden":  # local patch 2026-11-11: tool count stays in task/compact footers
             waiting.append(f"工具 #{session.tool_count}")
         if session.created_at:
             # Only once there is a second to show: a freshly-armed approval would otherwise read
@@ -2768,7 +2768,7 @@ def _render_footer(
         # the title — the user asked for "工具 N · <time>" order in both places (it used to be
         # time then count here).
         running = [f"{_spinner_frame()} {_status_tag('执行中', 'blue')}"] if include_status else []
-        if session.tool_count and not compact and tool_activity != "hidden":
+        if session.tool_count and tool_activity != "hidden":  # local patch 2026-11-11: tool count stays in task/compact footers
             # Maintainer note (contract change): hash before the count, matching the title.
             running.append(f"工具 #{session.tool_count}")
         running.append(_format_duration(max(0.0, _time.time() - float(session.created_at))))
@@ -2838,7 +2838,7 @@ def _render_footer(
         "output_rate": _format_output_rate(tokens),
     }
     selected = []
-    if session.tool_count and not compact:
+    if session.tool_count:  # local patch 2026-11-11: keep 工具 #N in task/compact footers
         # Maintainer note (contract change): the count leads the other metrics, matching the title
         # (it used to be appended last, after ctx); it carries a hash, per the user's request.
         selected.append(f"工具 #{session.tool_count}")

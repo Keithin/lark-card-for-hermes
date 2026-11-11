@@ -5,7 +5,11 @@ from pathlib import Path
 import threading
 from typing import Any, Mapping
 
-from .config_rules import normalize_native_chats as normalize_native_chats
+from .config_rules import (
+    normalize_card_chats as normalize_card_chats,
+    normalize_default_delivery as normalize_default_delivery,
+    normalize_native_chats as normalize_native_chats,
+)
 
 
 CARD_DISPOSITION = "card"
@@ -23,9 +27,17 @@ class ChatDeliveryPolicy:
         self,
         *,
         native_chats: tuple[str, ...] = (),
+        card_chats: tuple[str, ...] = (),
+        default_all: str = CARD_DISPOSITION,
+        default_by_type: Mapping[str, str] | None = None,
         profile_native_chats: Mapping[str, tuple[str, ...]] | None = None,
     ) -> None:
         self._native_chats = frozenset(native_chats)
+        self._card_chats = frozenset(card_chats)
+        self._default_all = default_all
+        self._default_by_type = {
+            str(chat_type): str(mode) for chat_type, mode in (default_by_type or {}).items()
+        }
         self._profile_native_chats = {
             str(profile_id): frozenset(chat_ids)
             for profile_id, chat_ids in (profile_native_chats or {}).items()
@@ -61,13 +73,30 @@ class ChatDeliveryPolicy:
             bindings = {}
         if not isinstance(bindings, Mapping):
             raise ValueError("bindings must be a mapping")
-        return cls(
-            native_chats=tuple(
-                normalize_native_chats(bindings.get("native_chats", []))
+        native_chats = tuple(normalize_native_chats(bindings.get("native_chats", [])))
+        card_chats = tuple(normalize_card_chats(bindings.get("card_chats", [])))
+        conflict = sorted(set(native_chats) & set(card_chats))
+        if conflict:
+            # 上游口径：同一 chat 同时出现在两个列表即配置错误，别静默取其中一个。
+            raise ValueError(
+                "bindings.native_chats and bindings.card_chats overlap: "
+                + ", ".join(conflict)
             )
+        defaults = normalize_default_delivery(bindings.get("default_delivery"))
+        return cls(
+            native_chats=native_chats,
+            card_chats=card_chats,
+            default_all=defaults["all"],
+            default_by_type={
+                chat_type: defaults[chat_type]
+                for chat_type in ("group", "p2p")
+                if defaults.get(chat_type)
+            },
         )
 
-    def decide(self, chat_id: str, *, profile_id: str = "") -> ChatDeliveryDecision:
+    def decide(self, chat_id: str, *, chat_type: str = "",
+               profile_id: str = "") -> ChatDeliveryDecision:
+        """单 chat 规则 → 会话类型默认 → 全局默认（上游 #492 的优先级）。"""
         normalized_chat_id = str(chat_id or "").strip()
         if not normalized_chat_id:
             return ChatDeliveryDecision(NATIVE_DISPOSITION, "chat_identity_missing")
@@ -76,14 +105,19 @@ class ChatDeliveryPolicy:
             native_chats = self._profile_native_chats.get(selected_profile)
             if native_chats is None:
                 return ChatDeliveryDecision(NATIVE_DISPOSITION, "profile_unknown")
+            card_chats = frozenset()
         else:
             native_chats = self._native_chats
+            card_chats = self._card_chats
         if normalized_chat_id in native_chats:
-            return ChatDeliveryDecision(
-                NATIVE_DISPOSITION,
-                "bindings.native_chats",
-            )
-        return ChatDeliveryDecision(CARD_DISPOSITION, "default_card")
+            return ChatDeliveryDecision(NATIVE_DISPOSITION, "bindings.native_chats")
+        if normalized_chat_id in card_chats:
+            return ChatDeliveryDecision(CARD_DISPOSITION, "bindings.card_chats")
+        normalized_type = str(chat_type or "").strip().lower()
+        if normalized_type in self._default_by_type:
+            mode = self._default_by_type[normalized_type]
+            return ChatDeliveryDecision(mode, f"bindings.default_delivery.{normalized_type}")
+        return ChatDeliveryDecision(self._default_all, "default")
 
     def safe_diagnostics(self) -> dict[str, int]:
         if self._profiles_enabled:
@@ -91,10 +125,12 @@ class ChatDeliveryPolicy:
                 "native_chat_count": sum(
                     len(chat_ids) for chat_ids in self._profile_native_chats.values()
                 ),
+                "card_chat_count": 0,
                 "profile_count": len(self._profile_native_chats),
             }
         return {
             "native_chat_count": len(self._native_chats),
+            "card_chat_count": len(self._card_chats),
             "profile_count": 0,
         }
 

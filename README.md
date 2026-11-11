@@ -1,145 +1,8 @@
 # Lark Card for Hermes（Hermes Agent飞书卡片回复）
 
-**English** · [简体中文](#简体中文)
+[简体中文](#简体中文)（默认） · [English](#english)
 
 ---
-
-## English
-
-Renders each Hermes reply in Feishu/Lark as **one live card** that updates in place — status header, tool timeline, collapsible reasoning panel, native tables, token footer, streaming body. One message per turn.
-
-This is a Hermes **platform plugin**. It overrides only the Feishu adapter's outbound `send` / `edit_message` primitives and never touches Hermes source code.
-
-![A real Feishu card: status header, a Markdown table rendered as a native table, and a token footer](docs/screenshot-card.png)
-
-*Screenshot taken from Feishu: a finished turn — status header, a Markdown table rendered as a **native table component** (header shading, cell borders, aligned columns, not a wall of `|` pipes), and the collapsible **execution panel** with every tool step. The footer shows duration, model and token usage.*
-
-### What you get
-
-- **Status header** — `⏳ running` → `✅ done` / `⛔ failed`, with distinct terminal states for failure and interruption.
-- **Tool timeline** — tool name, status, duration, redacted argument preview. Subagents show up too. Collapsed by default in `task` mode.
-- **Reasoning panel** — thinking goes into a collapsible block instead of the answer body.
-- **Native tables** — Markdown tables become Feishu `table` components.
-- **Footer** — duration, model, input/output tokens, context usage.
-- **Streaming body** — updates as it generates, no leftover cursor glyph when it finishes. Updates are coalesced and throttled to Feishu's 10-mutations-per-second per-card limit, with a 2 s full refresh so the footer clock keeps moving.
-- **Interactive clarify** — `clarify` options render as real buttons that send the answer back; a clicked card is frozen into a static receipt (text only, no controls), and expired or superseded prompts have their buttons withdrawn.
-- **Honest out-of-turn cards** — startup/cron notifications and slash-command replies have no turn behind them, so they render as a notice card marked done instead of a card stuck on `⏳ running` with a growing clock.
-- **Crash-safe cards** — each running turn keeps a display checkpoint. If the gateway dies mid-turn, the next start freezes that card into a finished "已中断" card (content kept, no spinner) instead of leaving it spinning forever.
-- **Command cards** — slash-command feedback gets its own card: title by command, colour by outcome (green done / red failed / blue running / orange warning).
-- **Command center** — the `/commands` menu renders as a three-level card (overview → category → detail) whose buttons navigate categories, go back, or re-dispatch a command; metric commands such as `/status` render as result cards with metric columns.
-- **Switch commands** — `/card-preset` and `/card-activity` change the reading preset and the live tool-call display (`full` / `summary` / `hidden`) on the fly.
-
-### Why it does not break when Hermes upgrades
-
-This is the design premise. The existing alternative (HFC) **injects hooks into Hermes source** and verifies those files by whole-file byte hash, so every new Hermes release invalidates the patch — its own changelog pins the exact commit it targets (e.g. `9b904dcc22c23...`).
-
-This project does the opposite:
-
-| | Source-injection approach | This project |
-| --- | --- | --- |
-| Modifies Hermes source | Yes | **No** |
-| Whole-file byte verification | Yes (breaks on upgrade) | No |
-| Event source | Injected hooks | Official plugin hooks (11 of them, all in `VALID_HOOKS`) |
-| Surface area | Many private symbols | Public `ctx.register_platform`; private seams confined to `compat/` (see `hermes plugins validate` output) |
-| Current-turn state | Process-wide globals | Explicit per-turn registry (`turn_state.py`): platform + session_key + chat/thread, keyed by public `turn_id` |
-
-The rendering logic reuses HFC's rendering stack (MIT, see `hfc/`). That code was **byte-identical** across HFC 5.0.9 → 5.0.13 — upstream's maintenance cost all goes into the source-adaptation layer, which this project does not need.
-
-Even if upstream changes a private function we depend on, the failure mode is **the card degrading to bundled text** (every `send` / `edit` has a fallback path), not Feishu going down.
-
-### Requirements
-
-- Hermes Agent **≥ 0.22** with a plugin system and hooks such as `post_gateway_admission` (tested on 0.23.x; `tests/run_all.py` 13/13 green)
-- `lark-oapi` **1.6.8** — that version's `Client._handle_data_frame` silently drops CARD frames, which makes **card button clicks do nothing**. `hfc/feishu_ws_compat.py` matches that function body by AST hash and repairs it; on a version mismatch it declines automatically (`connect()` logs whether the repair was applied).
-
-### Install
-
-```bash
-git clone https://github.com/Keithin/lark-card-for-hermes.git ~/.hermes/plugins/lark-card-for-hermes
-```
-
-Then restart the gateway **from a separate shell** (you cannot restart it from inside the gateway process):
-
-```bash
-hermes gateway restart
-```
-
-The plugin registers at gateway startup; editing plugin code requires a restart to take effect.
-
-Credentials reuse Hermes' existing Feishu configuration (environment variables or keychain). This plugin stores none of its own.
-
-### Configuration
-
-`config.json` (plugin root) is runtime state written by `/card-preset` and `/card-activity`, so it is **not tracked in git** — create it by hand or via those commands. Without it the HFC defaults apply; note the default is `native_tables: false` (markdown tables render as pipe text), so set `"native_tables": true` for Feishu-native tables. It is validated by `hfc/config_rules.py`. Every key follows HFC's existing schema:
-
-```json
-{
-  "card": {
-    "reading_preset": "task",
-    "native_tables": true,
-    "show_reasoning": true,
-    "timeline_order": "newest_first",
-    "timeline_expanded": false,
-    "max_timeline_items": 12,
-    "max_tool_result_chars": 600,
-    "table_overflow_mode": "compact",
-    "footer_fields": ["duration", "model", "input_tokens", "output_tokens", "context"]
-  },
-  "bindings": {
-    "native_chats": []
-  }
-}
-```
-
-#### Reading presets
-
-`reading_preset` has four levels, each changing the whole card layout:
-
-| preset | layout | thinking into body | timeline expanded | hide finished tools |
-| --- | --- | --- | --- | --- |
-| `classic` | classic | ✓ | ✗ | ✗ |
-| `focused` | classic | ✗ | ✗ | ✓ |
-| `detailed` | classic | ✗ | ✓ | ✗ |
-| `task` | task | ✗ | ✓ | ✓ |
-
-> **Note:** values written explicitly under `card` **override** the preset defaults. When switching presets, delete the conflicting old keys — otherwise only half the preset applies.
-
-#### Per-chat: card or native text
-
-```json
-"bindings": { "native_chats": ["oc_xxxxxxxx"] }
-```
-
-Listed chats get native Feishu text; everything else keeps cards. An empty array or a missing key means all chats use cards.
-
-### Layout
-
-```
-__init__.py          # plugin entry: public ctx.register_platform + 11 hooks + clarify button cards
-plugin.yaml          # manifest (plugin ID = catalog key = lark-card-for-hermes)
-turn_state.py        # explicit per-turn registry (replaces process-wide current-turn globals)
-compat/              # thin layer over the bundled adapter's registry entry (tested support range)
-tests/               # 13 behavior checks (isolated HERMES_HOME), run_all.py runs them all
-hfc/                 # HFC rendering stack (MIT), used as-is
-  bridge.py          #   ← new here: event translation layer
-  client.py          #   ← new here: minimal REST channel
-  render.py session.py cardkit.py card_timeline.py native_tables.py ...
-```
-
-The rendering and state-machine code under `hfc/` comes from [Hermes Feishu Streaming Card](https://github.com/baileyh8/hermes-feishu-streaming-card) (MIT). The code added by this project is the wiring layer (`bridge.py` / `client.py`), the turn registry (`turn_state.py`), the thin registry-compat layer (`compat/`), the entry point (`__init__.py`) and the behavior checks (`tests/`).
-
-### Known limitations
-
-- Session state is kept for the most recent 64 chats (LRU). A chat that falls off the list starts its card from scratch when it returns.
-- The footer never shows a token rate (upstream `observed_rate` was dropped as unwired; re-add from HFC ≥5.0.14 if a rate field is ever wanted).
-
-### License
-
-MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE`.
-
----
-
-## 简体中文
 
 把 Hermes 在飞书里的回复渲染成**一张持续更新的卡片**——状态头、工具时间线、可折叠思考面板、原生表格、token 统计、流式正文，一回合一条消息。
 
@@ -155,7 +18,7 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 - **工具时间线**：工具名、状态、耗时、脱敏后的参数预览；子代理同样上榜。`task` 模式下默认折叠。
 - **思考面板**：推理进可折叠区域，不占正文。
 - **原生表格**：Markdown 表格渲染成飞书 `table` 组件。
-- **footer**：用时、模型、输入/输出 token、上下文用量。
+- **footer**：状态胶囊、工具调用次数（`工具 #N`，任一阅读预设都显示）、用时、模型、输入/输出 token、上下文用量（`ctx 已用/窗口 百分比`）。
 - **流式正文**：边生成边更新，结束不留光标字符。更新做攒批合并并按飞书单卡 10 次/秒上限限速，另有 2s 周期整卡刷新，footer 计时不会冻住。
 - **交互式 clarify**：选项渲染成真按钮，点了会真的回传；点过的卡冻结成静态回执（只留文字、不留控件），超时或被取代的提问会把按钮撤下。
 - **回合外卡片不装忙**：启动通知、定时任务、斜杠命令的回复身后没有回合，渲染成已收尾的 notice 卡，而不是一张永远「⏳ 执行中」、计时还在涨的卡。
@@ -163,6 +26,11 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 - **命令卡**：斜杠命令的反馈用专门的卡——标题随命令、配色随结果（绿=完成 / 红=失败 / 蓝=进行中 / 橙=警告）。
 - **命令中心**：`/commands` 菜单渲染成三层卡（概览 → 分类 → 详情），按钮能跳分类、返回、复投命令；`/status` 这类指标命令渲染成带指标列的结果卡。
 - **切换命令**：`/card-preset`、`/card-activity` 随时切换阅读预设和实时工具调用显示（`full` / `summary` / `hidden`）。
+- **私有依赖全部有本地兜底**：工具参数预览、`ask_choice` 菜单、命令注册表、内置 feishu 平台的准入声明——任一 Hermes 内部模块改名/重构时自动降级到本地实现（日志与 `/card-status` 可见），不会整片失效；lark-oapi 的 CARD 帧修补改为「哈希精确匹配 + 结构匹配」双层，SDK 补丁版不再整段放弃。
+- **运维命令**：`/card-status`（版本、hooks、lark-oapi CARD 帧修补、投递计数/速率/错误码、点击去重、维护态、配置漂移）、`/card-doctor`（导出脱敏支持报告到 `~/.hermes/logs/lark-card-support-*.json`）、`/card-maintenance <on|off|status>`（升级窗口期跳过流式编辑，终稿照常投递）。
+- **回合外通知**：不属于任何回合的通知（定时任务结果、自我改进回顾）独立成卡、footer 干净，不再继承上一回合的耗时/token。
+- **回合串行收尾**：上一回合还没结束时你又发了新消息，旧回合的卡片会**立刻封口**（终态 + 「本轮已被新对话替代，任务尚未确认完成。」），新消息和它的卡排在后面 —— 不会出现「卡片还在跑、我的命令却排在它下面」的错位。开关：环境变量 `LARK_CARD_SEAL_ON_NEW_MESSAGE=0` 关闭该行为。
+- **新卡挂到触发消息上**：卡片会以「回复你那条消息」的形式发出（reply 锚），所以即使中途又发了一条，卡片也始终贴着它回答的那条消息，不会看起来排在你的命令前面。关闭：`LARK_CARD_REPLY_ANCHOR=0`（锚定失败时自动无锚重发一次，不影响投递）。
 
 ### 为什么不会因为 Hermes 升级而挂
 
@@ -184,7 +52,7 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 
 ### 依赖
 
-- 带插件系统和 `post_gateway_admission` 等 hooks 的 Hermes Agent **≥ 0.22**（0.23.x 上 `tests/run_all.py` 13/13 全绿）
+- 带插件系统和 `post_gateway_admission` 等 hooks 的 Hermes Agent **≥ 0.22**（0.23.x 上 `tests/run_all.py` 15/15 全绿）
 - `lark-oapi` **1.6.8** —— 该版本的 `Client._handle_data_frame` 会静默丢弃 CARD 帧，导致**卡片按钮点击无效**。`hfc/feishu_ws_compat.py` 用 AST 精确匹配那段函数体并修掉；版本不符会自动放弃（`connect()` 成功后日志会写明是否修复）。
 
 ### 安装
@@ -239,13 +107,57 @@ hermes gateway restart
 
 > **注意**：显式写在 `card` 里的值会**覆盖**预设默认。切预设时要把冲突的旧键删掉，否则只生效一半。
 
-#### 按 chat 选择卡片或原生文本
+#### 按 chat / 会话类型选择卡片或原生文本
 
 ```json
-"bindings": { "native_chats": ["oc_xxxxxxxx"] }
+{
+  "card": {
+    "chat_overrides": {
+      "oc_group_a": { "tool_activity": "hidden", "show_reasoning": false }
+    }
+  },
+  "bindings": {
+    "default_delivery": { "group": "native", "p2p": "card" },
+    "native_chats": ["oc_force_native"],
+    "card_chats": ["oc_group_exception"]
+  }
+}
 ```
 
-列进去的 chat 走飞书原生文本，其余仍走卡片。留空数组或不写该键 = 全部走卡片。
+- `default_delivery`：标量 `card` / `native`，或按类型 `{group: native, p2p: card}`；
+  优先级 **单 chat → 会话类型 → 全局默认**（`native_chats` 与 `card_chats` 是单 chat 名单，
+  同一 chat 同时出现在两边会在加载配置时报错）。`chat_type` 缺失或无法识别时类型规则不生效。
+- `card.chat_overrides`：只允许覆盖 `tool_activity`、`show_reasoning`、`stream_thinking_to_body`、
+  `hide_completed_tool_activity` 四个显示字段，**在会话创建时固定**，进行中的卡片不会中途换外观；
+  非法字段/取值在加载配置时报错。
+  另外可用 `"group"` / `"p2p"` 作为作用域键（类型覆盖先叠、精确 chat 最后叠），并新增
+  `suppressed_notice_kinds: [self-improvement | memory | cron | background-task | system]`
+  直接丢弃该类系统通知（不回落纯文本）。
+
+#### 完成推送（completion_notify）
+
+飞书对 PATCH 编辑不推送、不亮红点，所以「长任务跑完叫我」只能靠额外一条新消息：
+
+```json
+"card": { "completion_notify": { "enabled": true, "placement": "message",
+                                 "mention": true, "min_duration_seconds": 60 } }
+```
+
+- `min_duration_seconds`：0（默认）= 每轮都推；设 60 则只推 ≥60s 的轮次。
+- 耗时优先取实测；`message.completed` 缺 duration 时回退「现在 − 会话创建时刻」，
+  否则恰恰会把最该通知的长任务全部跳过。
+- 拿不到 `open_id` 时发**不带 @** 的通知（不会整条消失）。
+
+#### 超限策略（over_limit）
+
+```json
+"card": { "over_limit": "native" }      // 默认：占位卡 + 原生文本全文
+"card": { "over_limit": "segmented" }   // 主卡 + 编号续卡（最多 5 张）
+```
+
+卡片超过 28KB JSON / 200 元素 / 5 表时：`native` 发一张占位卡再把全文作为原生文本补发；
+`segmented` 则按 markdown 块边界无损切分，主卡承载开头（含 footer 统计与过程面板），
+续卡标题带「（2/3）」、每张单独验证装得下；任一环节不可行或投递失败 → 回退原生文本。
 
 ### 结构
 
@@ -254,7 +166,7 @@ __init__.py          # 插件入口：公开 ctx.register_platform + 11 个 hook
 plugin.yaml          # 插件清单（插件 ID = catalog key = lark-card-for-hermes）
 turn_state.py        # 显式每回合注册表（替代进程级「当前回合」全局变量）
 compat/              # 内置 adapter 条目的薄兼容层（声明并测试支持范围）
-tests/               # 13 项行为判据（隔离 HERMES_HOME），run_all.py 一键全跑
+tests/               # 15 项行为判据（隔离 HERMES_HOME），run_all.py 一键全跑
 hfc/                 # HFC 渲染栈（MIT），原样复用
   bridge.py          #   ← 本项目新增：事件翻译层
   client.py          #   ← 本项目新增：最小 REST 通道
@@ -271,3 +183,189 @@ hfc/                 # HFC 渲染栈（MIT），原样复用
 ### 许可
 
 MIT。`hfc/` 目录保留上游版权声明，详见 `LICENSE`。
+
+---
+
+## English
+
+> This is the English appendix; the default language of this document is Chinese.
+
+Renders each Hermes reply in Feishu/Lark as **one live card** that updates in place — status header, tool timeline, collapsible reasoning panel, native tables, token footer, streaming body. One message per turn.
+
+This is a Hermes **platform plugin**. It overrides only the Feishu adapter's outbound `send` / `edit_message` primitives and never touches Hermes source code.
+
+![A real Feishu card: status header, a Markdown table rendered as a native table, and a token footer](docs/screenshot-card.png)
+
+*Screenshot taken from Feishu: a finished turn — status header, a Markdown table rendered as a **native table component** (header shading, cell borders, aligned columns, not a wall of `|` pipes), and the collapsible **execution panel** with every tool step. The footer shows duration, model and token usage.*
+
+### What you get
+
+- **Status header** — `⏳ running` → `✅ done` / `⛔ failed`, with distinct terminal states for failure and interruption.
+- **Tool timeline** — tool name, status, duration, redacted argument preview. Subagents show up too. Collapsed by default in `task` mode.
+- **Reasoning panel** — thinking goes into a collapsible block instead of the answer body.
+- **Native tables** — Markdown tables become Feishu `table` components.
+- **Footer** — state pill, tool-call count (`工具 #N`, shown in every reading preset), duration, model, input/output tokens, and context usage (`ctx used/window percent`).
+- **Streaming body** — updates as it generates, no leftover cursor glyph when it finishes. Updates are coalesced and throttled to Feishu's 10-mutations-per-second per-card limit, with a 2 s full refresh so the footer clock keeps moving.
+- **Interactive clarify** — `clarify` options render as real buttons that send the answer back; a clicked card is frozen into a static receipt (text only, no controls), and expired or superseded prompts have their buttons withdrawn.
+- **Honest out-of-turn cards** — startup/cron notifications and slash-command replies have no turn behind them, so they render as a notice card marked done instead of a card stuck on `⏳ running` with a growing clock.
+- **Crash-safe cards** — each running turn keeps a display checkpoint. If the gateway dies mid-turn, the next start freezes that card into a finished "已中断" card (content kept, no spinner) instead of leaving it spinning forever.
+- **Command cards** — slash-command feedback gets its own card: title by command, colour by outcome (green done / red failed / blue running / orange warning).
+- **Command center** — the `/commands` menu renders as a three-level card (overview → category → detail) whose buttons navigate categories, go back, or re-dispatch a command; metric commands such as `/status` render as result cards with metric columns.
+- **Switch commands** — `/card-preset` and `/card-activity` change the reading preset and the live tool-call display (`full` / `summary` / `hidden`) on the fly.
+- **Every private dependency has a local fallback** — tool-argument preview, `ask_choice` menus, the command registry and the bundled feishu platform declaration all degrade to in-tree implementations when a Hermes internal moves (visible in the log and in `/card-status`); the lark-oapi CARD-frame repair is now two-tier (exact body hash, then structural match) so SDK patch releases are no longer rejected wholesale.
+- **Ops commands** — `/card-status` (version, hooks, lark-oapi CARD-frame repair, delivery counters/rates/error codes, click dedupe, maintenance state, config-drift), `/card-doctor` (writes a redacted support report to `~/.hermes/logs/lark-card-support-*.json`), `/card-maintenance <on|off|status>` (skip streaming edits during a Hermes upgrade window; final answers still delivered).
+- **Out-of-turn notices** — notices that belong to no turn (cron results, self-improvement reviews) get their own card and a clean footer; they no longer inherit the previous turn's duration/tokens.
+- **Serialised turns** — if you send a new message while the previous turn is still running, the old card is sealed immediately (terminal state plus "本轮已被新对话替代，任务尚未确认完成。") so your message and its card come after it, instead of a live card sitting above your question. Opt out with `LARK_CARD_SEAL_ON_NEW_MESSAGE=0`.
+- **Cards anchored to their trigger** — each card is posted as a reply to the message it answers (reply anchor), so it stays attached to that message even if you send another one mid-turn. Disable with `LARK_CARD_REPLY_ANCHOR=0`; a failed anchor is retried once without it, delivery is never lost.
+
+### Why it does not break when Hermes upgrades
+
+This is the design premise. The existing alternative (HFC) **injects hooks into Hermes source** and verifies those files by whole-file byte hash, so every new Hermes release invalidates the patch — its own changelog pins the exact commit it targets (e.g. `9b904dcc22c23...`).
+
+This project does the opposite:
+
+| | Source-injection approach | This project |
+| --- | --- | --- |
+| Modifies Hermes source | Yes | **No** |
+| Whole-file byte verification | Yes (breaks on upgrade) | No |
+| Event source | Injected hooks | Official plugin hooks (11 of them, all in `VALID_HOOKS`) |
+| Surface area | Many private symbols | Public `ctx.register_platform`; private seams confined to `compat/` (see `hermes plugins validate` output) |
+| Current-turn state | Process-wide globals | Explicit per-turn registry (`turn_state.py`): platform + session_key + chat/thread, keyed by public `turn_id` |
+
+The rendering logic reuses HFC's rendering stack (MIT, see `hfc/`). That code was **byte-identical** across HFC 5.0.9 → 5.0.13 — upstream's maintenance cost all goes into the source-adaptation layer, which this project does not need.
+
+Even if upstream changes a private function we depend on, the failure mode is **the card degrading to bundled text** (every `send` / `edit` has a fallback path), not Feishu going down.
+
+### Requirements
+
+- Hermes Agent **≥ 0.22** with a plugin system and hooks such as `post_gateway_admission` (tested on 0.23.x; `tests/run_all.py` 15/15 green)
+- `lark-oapi` **1.6.8** — that version's `Client._handle_data_frame` silently drops CARD frames, which makes **card button clicks do nothing**. `hfc/feishu_ws_compat.py` matches that function body by AST hash and repairs it; on a version mismatch it declines automatically (`connect()` logs whether the repair was applied).
+
+### Install
+
+```bash
+git clone https://github.com/Keithin/lark-card-for-hermes.git ~/.hermes/plugins/lark-card-for-hermes
+```
+
+Then restart the gateway **from a separate shell** (you cannot restart it from inside the gateway process):
+
+```bash
+hermes gateway restart
+```
+
+The plugin registers at gateway startup; editing plugin code requires a restart to take effect.
+
+Credentials reuse Hermes' existing Feishu configuration (environment variables or keychain). This plugin stores none of its own.
+
+### Configuration
+
+`config.json` (plugin root) is runtime state written by `/card-preset` and `/card-activity`, so it is **not tracked in git** — create it by hand or via those commands. Without it the HFC defaults apply; note the default is `native_tables: false` (markdown tables render as pipe text), so set `"native_tables": true` for Feishu-native tables. It is validated by `hfc/config_rules.py`. Every key follows HFC's existing schema:
+
+```json
+{
+  "card": {
+    "reading_preset": "task",
+    "native_tables": true,
+    "show_reasoning": true,
+    "timeline_order": "newest_first",
+    "timeline_expanded": false,
+    "max_timeline_items": 12,
+    "max_tool_result_chars": 600,
+    "table_overflow_mode": "compact",
+    "footer_fields": ["duration", "model", "input_tokens", "output_tokens", "context"]
+  },
+  "bindings": {
+    "native_chats": []
+  }
+}
+```
+
+#### Reading presets
+
+`reading_preset` has four levels, each changing the whole card layout:
+
+| preset | layout | thinking into body | timeline expanded | hide finished tools |
+| --- | --- | --- | --- | --- |
+| `classic` | classic | ✓ | ✗ | ✗ |
+| `focused` | classic | ✗ | ✗ | ✓ |
+| `detailed` | classic | ✗ | ✓ | ✗ |
+| `task` | task | ✗ | ✓ | ✓ |
+
+> **Note:** values written explicitly under `card` **override** the preset defaults. When switching presets, delete the conflicting old keys — otherwise only half the preset applies.
+
+#### Per-chat / per-chat-type delivery
+
+```json
+{
+  "card": { "chat_overrides": { "oc_group_a": { "tool_activity": "hidden" } } },
+  "bindings": {
+    "default_delivery": { "group": "native", "p2p": "card" },
+    "native_chats": ["oc_force_native"],
+    "card_chats": ["oc_group_exception"]
+  }
+}
+```
+
+- `default_delivery`: a scalar `card` / `native`, or by chat type `{group: native, p2p: card}`.
+  Precedence is **exact chat → chat type → global default**; `native_chats` / `card_chats` are the exact-chat
+  lists and the same chat appearing in both fails at load. A missing/unrecognised chat type skips the type rule.
+- `card.chat_overrides`: may only override `tool_activity`, `show_reasoning`, `stream_thinking_to_body`
+  and `hide_completed_tool_activity`, fixed when the session is created (a running card never changes
+  appearance mid-turn); unknown fields or values fail at load.
+  `"group"` / `"p2p"` are accepted as scope keys (chat-type rules merge first, the exact chat wins), and
+  `suppressed_notice_kinds: [self-improvement | memory | cron | background-task | system]` drops those
+  system notices outright (no plain-text fallback).
+
+#### Completion push (completion_notify)
+
+Feishu does not notify or badge on a PATCH-ed message, so "tell me when the long job finishes" needs a
+separate message:
+
+```json
+"card": { "completion_notify": { "enabled": true, "placement": "message",
+                                 "mention": true, "min_duration_seconds": 60 } }
+```
+
+- `min_duration_seconds`: `0` (default) notifies every turn; `60` notifies only turns that lasted ≥60s.
+- Elapsed time prefers the measured duration and falls back to `now - session created_at`, because a
+  missing duration would otherwise skip exactly the long turns this option exists for.
+- Without an `open_id` the notice is sent **without** a mention instead of being dropped.
+
+#### Over-limit policy (over_limit)
+
+```json
+"card": { "over_limit": "native" }      // default: placeholder card + full native text
+"card": { "over_limit": "segmented" }   // main card + numbered continuation cards (max 5)
+```
+
+Past 28KB JSON / 200 elements / 5 tables: `native` sends a placeholder card and then the full answer as
+native text; `segmented` splits losslessly on markdown block boundaries, keeps the opening (footer stats,
+process panel) on the main card, numbers continuations ("2/3") and verifies every card fits. Any
+impossible step or failed delivery falls back to native text.
+
+### Layout
+
+```
+__init__.py          # plugin entry: public ctx.register_platform + 11 hooks + clarify button cards
+plugin.yaml          # manifest (plugin ID = catalog key = lark-card-for-hermes)
+turn_state.py        # explicit per-turn registry (replaces process-wide current-turn globals)
+compat/              # thin layer over the bundled adapter's registry entry (tested support range)
+tests/               # 13 behavior checks (isolated HERMES_HOME), run_all.py runs them all
+hfc/                 # HFC rendering stack (MIT), used as-is
+  bridge.py          #   ← new here: event translation layer
+  client.py          #   ← new here: minimal REST channel
+  render.py session.py cardkit.py card_timeline.py native_tables.py ...
+```
+
+The rendering and state-machine code under `hfc/` comes from [Hermes Feishu Streaming Card](https://github.com/baileyh8/hermes-feishu-streaming-card) (MIT). The code added by this project is the wiring layer (`bridge.py` / `client.py`), the turn registry (`turn_state.py`), the thin registry-compat layer (`compat/`), the entry point (`__init__.py`) and the behavior checks (`tests/`).
+
+### Known limitations
+
+- Session state is kept for the most recent 64 chats (LRU). A chat that falls off the list starts its card from scratch when it returns.
+- The footer never shows a token rate (upstream `observed_rate` was dropped as unwired; re-add from HFC ≥5.0.14 if a rate field is ever wanted).
+
+### License
+
+MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE`.
+
+---

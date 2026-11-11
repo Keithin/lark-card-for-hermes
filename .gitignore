@@ -4,5 +4,9 @@ __pycache__/
 .DS_Store
 config.local.json
 *.log
-state/
 config.json
+
+# 本地备份
+*.bak-*
+
+tests/.hermes-home/
