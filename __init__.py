@@ -477,15 +477,50 @@ def _complete(turn: Optional[Turn], *, kind: str, ident: str = "", name: str = "
     REGISTRY.complete_row(turn, kind=kind, ident=ident, name=name, status=status, ms=ms)
 
 
+def _source_field(source: Any, name: str) -> str:
+    """钩子载荷兼容：`source` 可能是 dict、dataclass 或普通对象。"""
+    if isinstance(source, dict):
+        return str(source.get(name) or "")
+    return str(getattr(source, name, "") or "")
+
+
+def _chat_from_session_key(session_key: str) -> str:
+    """`agent:main:feishu:dm:oc_xxx` → `oc_xxx`（钩子没给 chat_id 时的兜底）。"""
+    tail = str(session_key or "").rsplit(":", 1)[-1].strip()
+    return tail if tail.startswith(("oc_", "on_")) else ""
+
+
+_TURN_MISS_LOG: dict[str, float] = {}
+
+
+def _note_turn_miss(chat_id: str, thread_id: str) -> None:
+    """投递侧找不到回合时留现场证据（同 chat 60s 一条），避免「footer 莫名没数字」无从追。"""
+    now = time.monotonic()
+    last = _TURN_MISS_LOG.get(chat_id, 0.0)
+    if now - last < 60.0:
+        return
+    _TURN_MISS_LOG[chat_id] = now
+    try:
+        active = [t for t in REGISTRY.active() if t.platform == "feishu"]
+        snapshot = ", ".join(f"{t.chat_id or '<empty>'}/{t.thread_id or '-'}" for t in active) or "<none>"
+    except Exception:
+        snapshot = "<unavailable>"
+    logger.warning("[feishu-card] turn lookup missed: chat=%s thread=%r active=[%s] — 该回合按通知卡处理",
+                   chat_id or "<empty>", thread_id, snapshot)
+
+
 def _on_admission(platform: str = "", source: Any = None, session_key: str = "", **_kw: Any) -> None:
     """一次入站消息 = 一个回合：注册新回合，并给 HFC 状态机开新 session。"""
-    if platform != "feishu":
+    if platform and platform != "feishu":
         return
-    src = source if isinstance(source, dict) else {}
+    chat_id = _source_field(source, "chat_id") or _chat_from_session_key(session_key)
+    thread_id = _source_field(source, "thread_id")
     turn = REGISTRY.begin(
-        platform=platform, session_key=str(session_key or ""),
-        chat_id=str(src.get("chat_id") or ""), thread_id=str(src.get("thread_id") or ""),
+        platform="feishu", session_key=str(session_key or ""),
+        chat_id=chat_id, thread_id=thread_id,
     )
+    logger.debug("[feishu-card] turn registered id=%s chat=%s thread=%r session=%s",
+                 turn.turn_id, chat_id or "<empty>", thread_id, session_key)
     publish_canonical_turn_id(turn.turn_id)
     if turn.chat_id:
         with _TURNS_LOCK:
@@ -707,6 +742,7 @@ def _build_adapter_class(base: Any) -> type:
                 # 否则整回合会被判成「回合外」，正常回复变成通知卡、footer 丢耗时/token）
                 loose = REGISTRY.for_chat_loose(platform="feishu", chat_id=str(chat_id or ""))
                 if loose is None:
+                    _note_turn_miss(str(chat_id or ""), thread_id)
                     return None
                 logger.debug("[feishu-card] turn matched by chat only (thread=%r)", thread_id)
                 turn = loose

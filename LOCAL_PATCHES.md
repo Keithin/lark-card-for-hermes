@@ -33,6 +33,18 @@
 判据：`tests/check_compat.py`（6 组）——预览兜底、结构修补命中、already_ok、真干活分支不改写、
 静态平台声明、静态命令注册表。`run_all.py` 13 → **15** 项。
 
+## 回合登记的两处硬化（1.7.12 后续）
+
+现场：重启后的某些回合仍被判成通知卡（`notice=1`），说明 `_turn_for` 连兜底都命不中——
+即 REGISTRY 里**没有这个 chat 的回合**，问题在登记侧而非匹配侧。
+
+| 硬化 | 说明 |
+|---|---|
+| `_source_field()` | `post_gateway_admission` 的 `source` 可能是 dict / dataclass / 普通对象，原来只认 dict → chat_id 空 |
+| `_chat_from_session_key()` | 钩子没给 chat_id 时从 `agent:main:feishu:dm:oc_xxx` 反推（只认 `oc_`/`on_` 前缀） |
+| `platform` 判断放宽 | `platform` 为空时不再直接 return（部分路径不带该字段） |
+| `_note_turn_miss()` | 查找失败打一条 warning（同 chat 60s 一条），带「当前活动回合的 chat/thread」快照，下次复发能直接定位 |
+
 ## 回合查找兜底（1.7.12，现场日志发现）
 
 实测日志：一整轮正常回复的每帧都是 `turn=-`，被判成回合外通知卡（`notice=1`），footer 因此没有耗时/token：
