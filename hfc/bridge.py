@@ -126,11 +126,23 @@ class HfcTurnBridge:
         self.config = load_card_config()
         self._sessions: dict[str, CardSession] = {}
         self._pushed: dict[str, int] = {}   # chat -> 已经喂过的累积正文长度
+        # 单 chat 的显示覆盖（上游 #492 的 card.chat_overrides）：会话创建时固定，
+        # 只允许显示类字段，进行中的卡片不中途改外观。
+        self._overrides: dict[str, dict[str, Any]] = {}
         self._order: OrderedDict[str, None] = OrderedDict()   # LRU：最近用过的 chat 排最后
         self._seq = 0
         self._store_dir = Path(store_dir) if store_dir is not None else STATE_DIR
         self._store: Optional[SessionStore] = None
         self._checkpointed: dict[str, float] = {}   # chat -> 上次落盘的时刻
+
+    @property
+    def _chat_overrides_map(self) -> dict[str, dict[str, Any]]:
+        """延迟初始化：测试/检查脚本会用 __new__ 造实例并手工塞属性。"""
+        mapping = getattr(self, "_overrides", None)
+        if mapping is None:
+            mapping = {}
+            self._overrides = mapping
+        return mapping
 
     def _touch(self, chat_id: str) -> None:
         """把 chat 标记为最近使用，超过 MAX_SESSIONS 时淘汰最久未用的会话状态。"""
@@ -199,8 +211,10 @@ class HfcTurnBridge:
             sequence=self._seq, created_at=time.time(), data=dict(data),
         ))
 
-    def start(self, chat_id: str, *, reply_to: str = "", delivery_kind: str = "chat") -> None:
+    def start(self, chat_id: str, *, reply_to: str = "", delivery_kind: str = "chat",
+              overrides: Optional[dict[str, Any]] = None) -> None:
         """一次入站消息 = 一个回合：新 session，时间线/正文归零。"""
+        self._chat_overrides_map[chat_id] = dict(overrides or {})
         self._sessions[chat_id] = CardSession(
             conversation_id=chat_id, message_id=f"turn-{chat_id}-{int(time.time() * 1000)}", chat_id=chat_id,
         )
@@ -305,14 +319,24 @@ class HfcTurnBridge:
         })
 
     # ── 渲染 ────────────────────────────────────────────────────────────────
+    def _config_for(self, chat_id: str) -> dict[str, Any]:
+        """这个会话生效的卡片配置：全局配置 + 单 chat 显示覆盖（仅白名单字段）。"""
+        overrides = self._chat_overrides_map.get(chat_id)
+        if not overrides:
+            return self.config
+        effective = dict(self.config)
+        effective.update(overrides)
+        return effective
+
     def render(self, chat_id: str, *, streaming: bool) -> Optional[dict[str, Any]]:
         """HFC `render_card` 出卡片 JSON —— 参数走 HFC 自己的 `card_render_options` 边界。"""
         session = self._sessions.get(chat_id)
         if session is None:
             return None
-        card = dict(render_card(display_view(session), title=self.config["title"],
-                                footer_fields=self.config["footer_fields"],
-                                **card_render_options(self.config)))
+        config = self._config_for(chat_id)
+        card = dict(render_card(display_view(session), title=config["title"],
+                                footer_fields=config["footer_fields"],
+                                **card_render_options(config)))
         config = card.setdefault("config", {})
         config["streaming_mode"] = bool(streaming)
         config.setdefault("update_multi", True)

@@ -45,6 +45,8 @@ class Turn:
     # 触发这个回合的入站消息 id（`post_gateway_admission` 的 message_id）。
     # 用来把新卡挂成该消息的回复锚，避免「卡片在上、用户消息在下」的错位观感。
     trigger_message_id: str = ""
+    # 会话类型（group / p2p）：决定 bindings.default_delivery 的取值。
+    chat_type: str = ""
 
     @property
     def key(self) -> tuple[str, str]:

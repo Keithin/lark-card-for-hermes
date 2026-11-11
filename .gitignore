@@ -8,3 +8,5 @@ config.json
 
 # 本地备份
 *.bak-*
+
+tests/.hermes-home/

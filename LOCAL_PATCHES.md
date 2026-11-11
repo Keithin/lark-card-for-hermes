@@ -241,3 +241,25 @@ tests/run_all.py = ALL PASS (15 checks)
 
 改动：有 `reply_to_message_id` 且形如 `[A-Za-z0-9_:-]{1,128}` → 走 reply 端点（不带 `receive_id`）；
 非法 id 或没有锚 → 原 create 端点。判据 `check_runtime.py` 断言路径/body，以及非法 id 退回 create。
+
+## P1：按会话类型/单 chat 的投递与显示覆盖（port of HFC #492 / v5.0.15）
+
+上游 v5.0.15 的能力我们只有 `bindings.native_chats`（逐个 chat 黑名单），缺少「群聊默认为原生文本」
+与「单 chat 显示差异」。按上游语义补齐（判据 `tests/check_policy.py`）：
+
+| 位置 | 改动 |
+|---|---|
+| `hfc/config_rules.py` | 新增 `normalize_delivery_mode` / `normalize_default_delivery`（标量或 `{group,p2p}`）/ `normalize_card_chats` / `normalize_chat_overrides`（白名单四字段，非法键/值加载即报错） |
+| `hfc/delivery_policy.py` | 支持 `native_chats` + `card_chats` + 类型默认；优先级 **单 chat → 会话类型 → 全局默认**；两名单重叠即 `ValueError`；`decide(chat_type=…)` |
+| `hfc/bridge.py` | `start(..., overrides=…)` + `render()` 用 `_config_for(chat)`：覆盖在会话创建时固定，不串到其它 chat（`_chat_overrides_map` 对 `__new__` 造的测试实例延迟初始化） |
+| `__init__.py` | `_delivery_chat_type()` 把网关原值（dm/group/channel/thread）归一成 p2p/group；`Turn.chat_type`；`_chat_overrides(chat)` 读 `card.chat_overrides`；admission 传 overrides；`send()` 先解析回合再判策略，日志加 `policy=` 与 `chat_type=` |
+
+行为口径与上游一致：`chat_type` 缺失/未知 → 类型规则不生效，只留单 chat 规则；覆盖只作用于
+`tool_activity` / `show_reasoning` / `stream_thinking_to_body` / `hide_completed_tool_activity`。
+
+## P2：诊断脱敏硬化（port of HFC #462 / v5.0.16 `redact_diagnostic_text`）
+
+`hfc/display_redaction.py` 整份替换为 v5.0.22 版本（新增 key=value、带引号值、`--flag '带空格值'`、
+`Authorization: Bearer/Basic/Negotiate`、URL userinfo 五类规则）；`hfc/diagnostics.py` 的
+`_sanitize()`（异常文本进卡片/文本报告）与 `_redact_tree()`（`/card-doctor` 落盘报告里的每个字符串）
+都改为过 `redact_diagnostic_text()`。判据见 `tests/check_policy.py` 第 4 节。

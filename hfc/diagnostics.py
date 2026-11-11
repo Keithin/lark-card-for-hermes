@@ -42,6 +42,13 @@ def _sanitize(text: str, *, limit: int = 200) -> str:
     raw = _KEY_VALUE_SECRET_RE.sub(
         lambda m: m.group(0) if m.group(3).startswith("***")
         else f"{m.group(1)}{m.group(2)}***", raw)
+    # Local patch 2026-11-11 (port of HFC #462): 结构化脱敏 —— key=value / 带引号值 /
+    # Authorization 头 / URL userinfo。异常文本里这四种最常见，且旧的单条正则漏得多。
+    try:
+        from .display_redaction import redact_diagnostic_text
+        raw = redact_diagnostic_text(raw)
+    except Exception:
+        pass
     return raw if len(raw) <= limit else raw[: limit - 1] + "…"
 
 
@@ -165,8 +172,15 @@ def _redact_tree(value: Any) -> Any:
         return out
     if isinstance(value, (list, tuple)):
         return [_redact_tree(item) for item in value]
-    if isinstance(value, str) and len(value) > 400:
-        return value[:400] + "…"
+    if isinstance(value, str):
+        # Local patch 2026-11-11: 报告里的每个字符串都过一遍结构化脱敏（key=value /
+        # 带引号值 / Authorization / URL userinfo），再做长度截断。
+        try:
+            from .display_redaction import redact_diagnostic_text
+            value = redact_diagnostic_text(value)
+        except Exception:
+            pass
+        return value if len(value) <= 400 else value[:400] + "…"
     return value
 
 

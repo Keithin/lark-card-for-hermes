@@ -107,13 +107,29 @@ hermes gateway restart
 
 > **注意**：显式写在 `card` 里的值会**覆盖**预设默认。切预设时要把冲突的旧键删掉，否则只生效一半。
 
-#### 按 chat 选择卡片或原生文本
+#### 按 chat / 会话类型选择卡片或原生文本
 
 ```json
-"bindings": { "native_chats": ["oc_xxxxxxxx"] }
+{
+  "card": {
+    "chat_overrides": {
+      "oc_group_a": { "tool_activity": "hidden", "show_reasoning": false }
+    }
+  },
+  "bindings": {
+    "default_delivery": { "group": "native", "p2p": "card" },
+    "native_chats": ["oc_force_native"],
+    "card_chats": ["oc_group_exception"]
+  }
+}
 ```
 
-列进去的 chat 走飞书原生文本，其余仍走卡片。留空数组或不写该键 = 全部走卡片。
+- `default_delivery`：标量 `card` / `native`，或按类型 `{group: native, p2p: card}`；
+  优先级 **单 chat → 会话类型 → 全局默认**（`native_chats` 与 `card_chats` 是单 chat 名单，
+  同一 chat 同时出现在两边会在加载配置时报错）。`chat_type` 缺失或无法识别时类型规则不生效。
+- `card.chat_overrides`：只允许覆盖 `tool_activity`、`show_reasoning`、`stream_thinking_to_body`、
+  `hide_completed_tool_activity` 四个显示字段，**在会话创建时固定**，进行中的卡片不会中途换外观；
+  非法字段/取值在加载配置时报错。
 
 ### 结构
 
@@ -249,13 +265,25 @@ Credentials reuse Hermes' existing Feishu configuration (environment variables o
 
 > **Note:** values written explicitly under `card` **override** the preset defaults. When switching presets, delete the conflicting old keys — otherwise only half the preset applies.
 
-#### Per-chat: card or native text
+#### Per-chat / per-chat-type delivery
 
 ```json
-"bindings": { "native_chats": ["oc_xxxxxxxx"] }
+{
+  "card": { "chat_overrides": { "oc_group_a": { "tool_activity": "hidden" } } },
+  "bindings": {
+    "default_delivery": { "group": "native", "p2p": "card" },
+    "native_chats": ["oc_force_native"],
+    "card_chats": ["oc_group_exception"]
+  }
+}
 ```
 
-Listed chats get native Feishu text; everything else keeps cards. An empty array or a missing key means all chats use cards.
+- `default_delivery`: a scalar `card` / `native`, or by chat type `{group: native, p2p: card}`.
+  Precedence is **exact chat → chat type → global default**; `native_chats` / `card_chats` are the exact-chat
+  lists and the same chat appearing in both fails at load. A missing/unrecognised chat type skips the type rule.
+- `card.chat_overrides`: may only override `tool_activity`, `show_reasoning`, `stream_thinking_to_body`
+  and `hide_completed_tool_activity`, fixed when the session is created (a running card never changes
+  appearance mid-turn); unknown fields or values fail at load.
 
 ### Layout
 

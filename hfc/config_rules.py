@@ -523,3 +523,99 @@ def normalize_native_chats(
             seen.add(chat_id)
             normalized.append(chat_id)
     return normalized
+
+
+# ── 按会话类型/单 chat 的投递与显示覆盖（port of HFC #492）──────────────────────
+# 上游 v5.0.15 引入：群聊默认走原生文本、私聊走卡片；单 chat 仍是最高优先级；
+# `card.chat_overrides` 只允许覆盖显示类字段，避免把整份配置塞进单个会话。
+DELIVERY_MODES = ("card", "native")
+CHAT_TYPES = ("group", "p2p")
+CHAT_OVERRIDE_FIELDS = (
+    "tool_activity",
+    "show_reasoning",
+    "stream_thinking_to_body",
+    "hide_completed_tool_activity",
+)
+_BOOLEAN_OVERRIDE_FIELDS = frozenset(
+    {"show_reasoning", "stream_thinking_to_body", "hide_completed_tool_activity"}
+)
+
+
+def normalize_delivery_mode(value: object, *, path: str = "bindings.default_delivery") -> str:
+    if not isinstance(value, str) or value.strip().lower() not in DELIVERY_MODES:
+        raise ValueError(f"{path} must be 'card' or 'native'")
+    return value.strip().lower()
+
+
+def normalize_default_delivery(
+    value: object, *, path: str = "bindings.default_delivery"
+) -> dict[str, str]:
+    """标量 ``card``/``native``，或 ``{group: native, p2p: card}``；返回 group/p2p/all。"""
+    resolved = {"all": "card", "group": "", "p2p": ""}
+    if value is None:
+        return resolved
+    if isinstance(value, str):
+        resolved["all"] = normalize_delivery_mode(value, path=path)
+        return resolved
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be 'card', 'native' or a mapping of chat types")
+    unknown = sorted(str(key) for key in value if str(key) not in CHAT_TYPES)
+    if unknown:
+        raise ValueError(f"{path} only accepts chat types: {', '.join(CHAT_TYPES)}")
+    for chat_type in CHAT_TYPES:
+        if chat_type in value:
+            resolved[chat_type] = normalize_delivery_mode(
+                value[chat_type], path=f"{path}.{chat_type}"
+            )
+    return resolved
+
+
+def normalize_chat_overrides(
+    value: object, *, path: str = "card.chat_overrides"
+) -> dict[str, dict[str, Any]]:
+    """``{chat_id: {显示字段: 值}}``；字段与取值都在白名单内，否则加载即报错。"""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be a mapping of exact chat ids")
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_chat_id, raw_override in value.items():
+        if not isinstance(raw_chat_id, str) or not raw_chat_id.strip():
+            raise ValueError(f"{path} keys must be non-empty exact chat ids")
+        chat_id = raw_chat_id.strip()
+        if len(chat_id) > _MAX_CHAT_ID_CHARS or any(
+            ord(character) < 32 or ord(character) == 127 for character in chat_id
+        ):
+            raise ValueError(f"{path}.{chat_id} must be a non-empty exact chat id")
+        if not isinstance(raw_override, Mapping) or not raw_override:
+            raise ValueError(f"{path}.{chat_id} must be a non-empty mapping")
+        selected: dict[str, Any] = {}
+        for field_name, raw_value in raw_override.items():
+            field = str(field_name)
+            if field not in CHAT_OVERRIDE_FIELDS:
+                raise ValueError(
+                    f"{path}.{chat_id}.{field} is not overridable "
+                    f"(allowed: {', '.join(CHAT_OVERRIDE_FIELDS)})"
+                )
+            if field == "tool_activity":
+                mode = str(raw_value or "").strip().lower()
+                if mode not in TOOL_ACTIVITY_MODES:
+                    raise ValueError(
+                        f"{path}.{chat_id}.tool_activity must be "
+                        f"{' / '.join(TOOL_ACTIVITY_MODES)}"
+                    )
+                selected[field] = mode
+            else:
+                if not isinstance(raw_value, bool):
+                    raise ValueError(f"{path}.{chat_id}.{field} must be true or false")
+                selected[field] = raw_value
+        normalized[chat_id] = selected
+    return normalized
+
+
+def normalize_card_chats(value: object, *, path: str = "bindings.card_chats") -> list[str]:
+    """``bindings.card_chats``：类型默认走原生文本时，仍要出卡片的例外群。
+
+    校验规则与 ``native_chats`` 完全一致（精确 chat id、去重、禁通配），只是路径不同。
+    """
+    return normalize_native_chats(value, path=path)

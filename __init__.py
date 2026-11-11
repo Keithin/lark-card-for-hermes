@@ -52,8 +52,8 @@ try:
     from .hfc.canonical_turn import consume_canonical_turn_id, publish_canonical_turn_id
     from .hfc.client import RestClient
     from .hfc.config_rules import (
-        READING_PRESETS, TOOL_ACTIVITY_MODES,
-        normalize_reading_preset, normalize_tool_activity,
+        CHAT_OVERRIDE_FIELDS, READING_PRESETS, TOOL_ACTIVITY_MODES,
+        normalize_chat_overrides, normalize_reading_preset, normalize_tool_activity,
     )
     from .hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from .hfc.feishu_ws_compat import (
@@ -221,6 +221,43 @@ def _plugin_config() -> dict[str, Any]:
         return json.loads((Path(__file__).parent / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+_CHAT_OVERRIDES: Optional[dict[str, dict[str, Any]]] = None
+# 网关的 chat_type 是平台原值（dm / group / channel / thread），
+# default_delivery 只认 p2p / group 两类，这里做归一。
+_GROUP_CHAT_TYPES = frozenset({"group", "channel", "thread", "topic"})
+_P2P_CHAT_TYPES = frozenset({"dm", "p2p", "private", "direct", "single"})
+
+
+def _delivery_chat_type(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if value in _GROUP_CHAT_TYPES:
+        return "group"
+    if value in _P2P_CHAT_TYPES:
+        return "p2p"
+    return ""
+
+
+def _chat_overrides(chat_id: str) -> dict[str, Any]:
+    """这个 chat 的显示覆盖（上游 #492 的 card.chat_overrides）。
+
+    只允许显示类字段（tool_activity / show_reasoning / stream_thinking_to_body /
+    hide_completed_tool_activity），非法字段在加载配置时就报错、这里只会拿到干净值。
+    覆盖在会话创建时固定 —— 进行中的卡片不会中途换外观。
+    """
+    global _CHAT_OVERRIDES
+    if not chat_id:
+        return {}
+    if _CHAT_OVERRIDES is None:
+        raw = (_plugin_config().get("card") or {})
+        raw_overrides = raw.get("chat_overrides") if isinstance(raw, dict) else None
+        try:
+            _CHAT_OVERRIDES = normalize_chat_overrides(raw_overrides)
+        except Exception as exc:
+            logger.warning("[feishu-card] card.chat_overrides 配置无效，忽略单 chat 覆盖: %s", exc)
+            _CHAT_OVERRIDES = {}
+    return dict(_CHAT_OVERRIDES.get(str(chat_id).strip(), {}))
 
 
 def _delivery_policy() -> ChatDeliveryPolicy:
@@ -621,14 +658,21 @@ def _on_admission(platform: str = "", source: Any = None, session_key: str = "",
         # 记住触发消息 id：投递侧用它把新卡挂成「回复」，飞书里就不会出现卡片在上、
         # 用户消息在下的错位观感（见 _reply_anchor）。
         turn.trigger_message_id = str(message_id)
+    # 会话类型（group / p2p）决定 default_delivery 的取值；缺失时类型规则不生效，
+    # 只保留单 chat 规则 —— 与上游 #492 一致。
+    turn.chat_type = _delivery_chat_type(_source_field(source, "chat_type"))
     # INFO 级：入站登记是回合归属的唯一来源，缺一条就等于「整回合被当通知卡」，
     # 这条日志常驻（每消息一行）以便事后对账；确认稳定后可降为 debug。
     logger.info("[feishu-card] admission platform=%r chat=%s thread=%r session=%s -> turn=%s",
                 platform, chat_id or "<empty>", thread_id, session_key, turn.turn_id)
     publish_canonical_turn_id(turn.turn_id)
     if turn.chat_id:
+        overrides = _chat_overrides(str(turn.chat_id))
         with _TURNS_LOCK:
-            _TURNS.start(_bridge_key(turn))
+            _TURNS.start(_bridge_key(turn), overrides=overrides)
+        if overrides:
+            logger.info("[feishu-card] chat overrides applied chat=%s fields=%s",
+                        turn.chat_id, sorted(overrides))
 
 
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, tool_call_id: str = "",
@@ -1285,18 +1329,26 @@ def _build_adapter_class(base: Any) -> type:
             from gateway.platforms.base import SendResult
 
             formatted = self.format_message(content)
-            # HFC 的两条直通规则：网关的忙/中断/压缩提示不是正文；bindings.native_chats 里的 chat 用原生文本
+            # 网关的忙/中断/压缩提示不是正文：直通原生发送，不绑定回合、不做策略判断。
             if (is_transient_busy_ack(formatted)
-                    or transient_notice_recall_seconds(formatted) is not None
-                    or _delivery_policy().decide(chat_id).disposition == NATIVE_DISPOSITION):
+                    or transient_notice_recall_seconds(formatted) is not None):
                 return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
             turn = self._turn_for(chat_id, metadata)
+            # 投递形态（上游 #492）：单 chat 名单 → 会话类型默认 → 全局默认。
+            # chat_type 缺失时类型规则不生效，只留单 chat 规则。
+            chat_type = str((turn.chat_type if turn is not None else "")
+                            or (metadata or {}).get("chat_type") or "")
+            decision = _delivery_policy().decide(chat_id, chat_type=chat_type)
+            if decision.disposition == NATIVE_DISPOSITION:
+                return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
             reply_to = self._reply_anchor(reply_to, turn)     # 新卡挂到触发消息上
             METRICS.inc("send")
             is_progress = MERGE_TOOL_CARD and looks_like_progress(formatted, self._tool_lines)
-            logger.info("[feishu-card] send chat=%s turn=%s len=%d progress=%s known=%d meta=%s anchor=%s",
+            logger.info("[feishu-card] send chat=%s turn=%s len=%d progress=%s known=%d meta=%s "
+                        "anchor=%s policy=%s chat_type=%s",
                         chat_id, (turn.turn_id if turn else "-"), len(formatted), is_progress,
-                        len(self._tool_lines), sorted((metadata or {}).keys()), bool(reply_to))
+                        len(self._tool_lines), sorted((metadata or {}).keys()), bool(reply_to),
+                        decision.reason, chat_type or "-")
             # 斜杠命令的反馈不是回答：用 HFC 的命令卡（标题/配色随命令与结果）。
             command_card, _center_id = (None, "") if is_progress else _command_card(
                 formatted, chat_id, turn_live=turn is not None)
