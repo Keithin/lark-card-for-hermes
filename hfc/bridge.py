@@ -23,7 +23,7 @@ from typing import Any, Optional
 from .config_rules import DEFAULT_CONFIG, merge_card_config, normalize_card_config
 from .display_segments import display_view
 from .events import SidecarEvent
-from .render import render_card
+from .render import render_card_result
 from .render_options import card_render_options
 from .session import CardSession
 from .session_store import SessionStore
@@ -134,6 +134,19 @@ class HfcTurnBridge:
         self._store_dir = Path(store_dir) if store_dir is not None else STATE_DIR
         self._store: Optional[SessionStore] = None
         self._checkpointed: dict[str, float] = {}   # chat -> 上次落盘的时刻
+
+    @property
+    def _disposition_map(self) -> dict[str, str]:
+        """chat -> 最近一次渲染的处置（card / native / deferred_native）。"""
+        mapping = getattr(self, "_dispositions", None)
+        if mapping is None:
+            mapping = {}
+            self._dispositions = mapping
+        return mapping
+
+    def last_disposition(self, chat_id: str) -> str:
+        """最近一次渲染是否还装得下：`native` = 卡片装不下，正文必须走原生文本。"""
+        return self._disposition_map.get(str(chat_id), "card")
 
     @property
     def _chat_overrides_map(self) -> dict[str, dict[str, Any]]:
@@ -334,9 +347,13 @@ class HfcTurnBridge:
         if session is None:
             return None
         config = self._config_for(chat_id)
-        card = dict(render_card(display_view(session), title=config["title"],
-                                footer_fields=config["footer_fields"],
-                                **card_render_options(config)))
+        result = render_card_result(display_view(session), title=config["title"],
+                                    footer_fields=config["footer_fields"],
+                                    **card_render_options(config))
+        # 超限处置必须传出去：只看 card 会把「装不下」错当成普通卡片，
+        # 结果用一张 400 字节的占位卡换掉整篇正文。
+        self._disposition_map[str(chat_id)] = str(result.disposition)
+        card = dict(result.card)
         config = card.setdefault("config", {})
         config["streaming_mode"] = bool(streaming)
         config.setdefault("update_multi", True)

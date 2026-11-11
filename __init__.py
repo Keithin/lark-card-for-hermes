@@ -92,8 +92,8 @@ except ImportError:  # 判据脚本按文件路径加载插件时没有包上下
     from hfc.canonical_turn import consume_canonical_turn_id, publish_canonical_turn_id
     from hfc.client import RestClient
     from hfc.config_rules import (
-        READING_PRESETS, TOOL_ACTIVITY_MODES,
-        normalize_reading_preset, normalize_tool_activity,
+        CHAT_OVERRIDE_FIELDS, READING_PRESETS, TOOL_ACTIVITY_MODES,
+        normalize_chat_overrides, normalize_reading_preset, normalize_tool_activity,
     )
     from hfc.delivery_policy import CARD_DISPOSITION, NATIVE_DISPOSITION, ChatDeliveryPolicy
     from hfc.feishu_ws_compat import (
@@ -228,6 +228,15 @@ _CHAT_OVERRIDES: Optional[dict[str, dict[str, Any]]] = None
 # default_delivery 只认 p2p / group 两类，这里做归一。
 _GROUP_CHAT_TYPES = frozenset({"group", "channel", "thread", "topic"})
 _P2P_CHAT_TYPES = frozenset({"dm", "p2p", "private", "direct", "single"})
+
+
+def _over_limit_chats(adapter: Any) -> set[str]:
+    """本 adapter 上「卡片装不下、正文待补发原生文本」的 chat 集合。"""
+    flag = getattr(adapter, "_over_limit_chats", None)
+    if flag is None:
+        flag = set()
+        adapter._over_limit_chats = flag
+    return flag
 
 
 def _delivery_chat_type(raw: Any) -> str:
@@ -1297,6 +1306,12 @@ def _build_adapter_class(base: Any) -> type:
                         METRICS.inc("notice_card")
                 _TURNS.answer_frame(key, text, create_notice=not live, fresh=fresh)
                 card = _TURNS.render(key, streaming=streaming)
+                # 卡片装不下 → 记账：正文随后改走原生文本，见 _flush_over_limit。
+                # `deferred_native` 是「流式期先占位、终态再交全文」，所以只有非流式渲染
+                # （终稿 / finalize）才算真的超限；否则会在流式途中就补发半截正文。
+                disposition = _TURNS.last_disposition(key)
+                if disposition == "native" or (disposition == "deferred_native" and not streaming):
+                    _over_limit_chats(self).add(str(chat_id))
             if card:
                 # 正文可能被 plan_main_content 拆成 main_content / main_content_1 …
                 # （含原生表格时第一段往往只有几十字的引导句），所以按前缀求和，
@@ -1389,6 +1404,7 @@ def _build_adapter_class(base: Any) -> type:
                             raise RuntimeError("cardkit update returned False")
                         METRICS.inc("edit")
                         RATE.observe()
+                        await self._flush_over_limit(chat_id, formatted)
                         return SendResult(success=True, message_id=existing)
                     except Exception as exc:
                         METRICS.inc("edit_failed", code=_error_code(exc))
@@ -1398,10 +1414,27 @@ def _build_adapter_class(base: Any) -> type:
             # 进度行只喂 timeline，正文那格留空给答复
             result = await self._send_card(chat_id, "" if is_progress else formatted, content,
                                            reply_to, metadata, turn=turn)
+            await self._flush_over_limit(chat_id, formatted)
             if result is not None and getattr(result, "message_id", ""):
                 self._remember_turn_card(chat_id, result.message_id, turn)
                 _TURNS.checkpoint(self._bridge_key_for(chat_id, metadata), result.message_id)
             return result
+
+        async def _flush_over_limit(self, chat_id: str, content: str) -> None:
+            """卡片装不下时把完整正文补发成原生文本。
+
+            `render_card` 在超限时给的是一张「完整内容已切换为 Hermes 原生消息发送」的占位卡；
+            HFC 原来靠 server 侧再投递全文，本插件没有那一层 —— 不补发就等于丢正文。
+            重复调用安全：标记消费后即清，最终稿再走一次也不会重发。
+            """
+            flag = _over_limit_chats(self)
+            if str(chat_id) not in flag or not str(content or "").strip():
+                return
+            flag.discard(str(chat_id))
+            METRICS.inc("over_limit_native")
+            logger.warning("[feishu-card] card cannot hold answer, delivering native text: "
+                           "chat=%s len=%d", chat_id, len(content))
+            await super().send(chat_id, content)
 
         async def _send_card(self, chat_id: str, main: str, content: str, reply_to, metadata,
                              *, turn: Optional["Turn"] = None):
@@ -1489,6 +1522,7 @@ def _build_adapter_class(base: Any) -> type:
                         message_id, self._card_v2(chat_id, text, streaming=not finalize, turn=turn)
                     ):
                         _TURNS.checkpoint(f"feishu:{chat_id}:{(turn.thread_id if turn else '')}", message_id)
+                        await self._flush_over_limit(chat_id, text)
                         return SendResult(success=True, message_id=message_id)
                     logger.warning("[feishu-card] cardkit update returned False, falling back")
                 except Exception as exc:

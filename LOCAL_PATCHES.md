@@ -263,3 +263,22 @@ tests/run_all.py = ALL PASS (15 checks)
 `Authorization: Bearer/Basic/Negotiate`、URL userinfo 五类规则）；`hfc/diagnostics.py` 的
 `_sanitize()`（异常文本进卡片/文本报告）与 `_redact_tree()`（`/card-doctor` 落盘报告里的每个字符串）
 都改为过 `redact_diagnostic_text()`。判据见 `tests/check_policy.py` 第 4 节。
+
+## P0：超限降级会丢正文（对齐上游 #511/#513 描述的降级链）
+
+`render_card` 在卡片超限（28KB JSON / 200 元素 / 5 表）时返回一张「完整内容已切换为 Hermes 原生消息发送」
+的占位卡并把处置写成 `disposition: native`。HFC 由 server 侧再投递全文；本插件只取了 `.card`，
+于是**超限轮次的回答正文直接消失，用户只看到占位卡**。实测：40k 字符正文 → 438 字节占位卡。
+
+修法（不引入 server 层，纯插件内闭环）：
+- `hfc/bridge.py::render()` 改用 `render_card_result()`，把处置存进 `_disposition_map[chat]`，
+  暴露 `last_disposition(chat)`；
+- `__init__.py::_card_v2()` 记账：`native`，或 `deferred_native` 且**非流式**渲染（终稿/finalize）
+  → `_over_limit_chats(adapter).add(chat)`。流式期的 `deferred_native` 不算，否则会中途补发半截正文；
+- `__init__.py::_flush_over_limit()`：卡片投递成功后把**完整正文**经 `super().send()` 补发（原生文本，
+  框架自行分条），三个出口都调：合并更新分支、`_send_card` 之后、`edit_message` 成功后；
+  标记消费即清，最终稿重复触发也不会重发（判据 `tests/check_overlimit.py`）。
+- 顺序保持“占位卡 + 正文消息”：用户在群里看到卡片提示，紧跟其后是可复制的全文。
+
+未做：`card.over_limit: segmented`（主卡 + 编号续卡，上游 #513）。当前回退到原生文本已保证不丢内容，
+分段卡是阅读体验优化，等确认需要再上。
