@@ -657,20 +657,55 @@ def _ensure_turn(platform: str = "", session_id: str = "") -> Optional["Turn"]:
     return turn
 
 
+def _api_context(usage: Any, context_length: Any) -> Optional[dict[str, int]]:
+    """页脚 ctx 段的唯一数据源：Hermes `usage.prompt_tokens` + 顶层 `context_length`。
+
+    Local patch 2026-11-11: Hermes 的 `post_api_request` 载荷把窗口上限放在**顶层**
+    `context_length`（`agent/turn_response_intake.py::_fire_post_api_request_hook`），
+    而 usage 里并没有 `context` 键；早先这里只读 `usage["context"]`，恒 None
+    ⇒ session.context 永远为空 ⇒ 页脚整段 `ctx 4k/1m 0%` 不渲染。
+    """
+    context: dict[str, int] = {}
+    if isinstance(usage, dict):
+        raw = usage.get("context")
+        if isinstance(raw, dict):
+            for key in ("used_tokens", "max_tokens"):
+                value = raw.get(key)
+                if type(value) is int and value >= 0:
+                    context[key] = value
+    if "used_tokens" not in context and isinstance(usage, dict):
+        for key in ("prompt_tokens", "total_tokens"):
+            value = usage.get(key)
+            if type(value) is int and value > 0:
+                context["used_tokens"] = value
+                break
+    if "used_tokens" not in context and isinstance(usage, dict):
+        base = usage.get("input_tokens")
+        if type(base) is int and base > 0:
+            cached = sum(usage.get(k) or 0 for k in ("cache_read_tokens", "cache_write_tokens")
+                         if type(usage.get(k)) in (int, float))
+            context["used_tokens"] = int(base + cached)
+    if "max_tokens" not in context and type(context_length) is int and context_length > 0:
+        context["max_tokens"] = context_length
+    return context or None
+
+
 def _on_post_api_request(usage: Any = None, model: str = "", provider: str = "",
-                         session_id: str = "", platform: str = "", **_kw: Any) -> None:
+                         session_id: str = "", platform: str = "",
+                         context_length: Any = None, **_kw: Any) -> None:
     """HFC 的 footer 要 model/tokens/context；这些只有 API 层知道。"""
     if platform and platform != "feishu":
         return
     turn = _ensure_turn(platform, session_id)
     if turn is None:
         return
+    context = _api_context(usage, context_length)
     if isinstance(usage, dict):
         tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else usage
-        REGISTRY.set_usage(turn, tokens=tokens, context=usage.get("context"),
+        REGISTRY.set_usage(turn, tokens=tokens, context=context,
                            model=model, provider=provider)
-    elif model or provider:
-        REGISTRY.set_usage(turn, model=model, provider=provider)
+    elif model or provider or context:
+        REGISTRY.set_usage(turn, model=model, provider=provider, context=context)
 
 
 def _on_agent_loop_stopped(reason: str = "", platform: str = "", session_id: str = "",

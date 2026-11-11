@@ -137,3 +137,44 @@
 - `/card-status` 的配置差异以「注册时快照」为基准；`/card-preset`、`/card-activity` 会刷新快照，
   其余命令若绕过这两条路径改 config.json，需要重启才能消除差异提示。
 - `notice_lifecycle` 判定仍是启发式（前缀 + 正文同源）；上游若有 producer 字段可替换为精确判定。
+
+## 页脚补丁（2026-11-11）：task 预设不再吞掉「工具 #N」
+
+上游 `hfc/render.py::_render_footer` 用 `compact=presentation=="task"` 判定，task 阅读预设下
+三处 `if session.tool_count and not compact` 全部不成立 ⇒ 正常回复卡页脚只剩
+`已完成 · 10s · model · ↑in · ↓out · ctx`，「工具 #N」整段消失（用户报「底栏少了一部分内容」）。
+
+| 位置 | 改动 |
+|---|---|
+| `_render_footer` waiting 分支（约 2745 行） | 去掉 `not compact` 条件，保留 `tool_activity != "hidden"` |
+| `_render_footer` running 分支（约 2771 行） | 同上 |
+| `_render_footer` completed 分支（约 2841 行） | 去掉 `not compact`，工具数重新领先其余指标 |
+
+`not compact` 仍保留在「上一次动作文案」分支（长文案在 task 卡里确实挤）。
+备份：`hfc/render.py.bak-20261111_095210`。离线验证（用真实 checkpoint 会话 render）：
+
+```
+TASK(patched): 已完成 · 工具 #5 · 2m52s · custom/cn:deepseek-v4.1-flash · ↑922 · ↓704
+```
+
+## 页脚 ctx 段补丁（2026-11-11 第二轮）：`ctx 4k/1m 0%` 恒缺失
+
+用户重启后仍无 ctx 段。根因不在渲染层，而在**取数**：`_on_post_api_request` 只读 `usage["context"]`，
+但 Hermes `post_api_request` 载荷把窗口上限放在**顶层 `context_length`**，usage 里根本没有 `context` 键
+（`agent/turn_response_intake.py::_fire_post_api_request_hook`，usage = `normalize_usage()` 的 asdict，
+只有 input/output/prompt/total/cache_* 等）；因此 `session.context` 恒 `{}`，渲染层
+`available["context"] = max_context > 0 and "used_tokens" in context` 永假 ⇒ 整段不显示。
+checkpoint 实测：`tokens.prompt_tokens=152986` 有值，`context={}`。
+
+| 位置 | 改动 |
+|---|---|
+| `__init__.py::_api_context`（新增） | `used_tokens` ← `usage.prompt_tokens`（回退 `total_tokens` → `input_tokens+cache_read+cache_write`）；`max_tokens` ← 顶层 `context_length`；若调用方已给 `usage["context"]` 则以其为准 |
+| `__init__.py::_on_post_api_request` | 新增 `context_length` 形参（`**_kw` 本来会接住，但显式声明后语义清楚），把 `_api_context()` 结果传入 `REGISTRY.set_usage(context=…)` |
+
+备份 `__init__.py.bak-20261111_095714`。离线全链路验证（hook → TurnRegistry → HfcTurnBridge → render）：
+```
+turn.usage.context = {"used_tokens": 152986, "max_tokens": 1000000}
+footer = 已完成 · 10s · custom/cn:deepseek-v4.1-flash · ↑922 · ↓704 · ctx 153k/1m 15%
+tests/run_all.py = ALL PASS (15 checks)
+```
+生效需用户在外部 shell 重启网关（插件跑在网关进程内，改文件不会自动重载）。
