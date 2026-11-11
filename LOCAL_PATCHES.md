@@ -230,3 +230,14 @@ tests/run_all.py = ALL PASS (15 checks)
 
 开关：`LARK_CARD_REPLY_ANCHOR=0`。判据：`tests/check_runtime.py`（锚取值优先级 / 开关 / 端到端传入 transport /
 失败降级），`check_seal.py`（admission 真的记下 message_id）。`run_all.py` = ALL PASS (16 checks)。
+
+## reply 锚必须走 reply 端点（2026-11-11 修正，1.7.17）
+
+1.7.16 加了 reply 锚但「没看到变化」，日志里 `anchor=True` 却没有任何引用块。根因在
+`hfc/client.py::send_card_delivery`：它把 `reply_message_id` 塞进
+`POST /im/v1/messages?receive_id_type=chat_id` 的 body —— **那不是官方字段**，飞书静默忽略。
+官方的「回复」是独立端点：`POST /im/v1/messages/{message_id}/reply`（内置适配器
+`_send_raw_message` 就是这么发的，`reply_in_thread` 仅在话题串里置 true）。
+
+改动：有 `reply_to_message_id` 且形如 `[A-Za-z0-9_:-]{1,128}` → 走 reply 端点（不带 `receive_id`）；
+非法 id 或没有锚 → 原 create 端点。判据 `check_runtime.py` 断言路径/body，以及非法 id 退回 create。

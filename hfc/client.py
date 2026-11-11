@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from typing import Any
 
 import aiohttp
 
 from .delivery import FeishuAPIError
+
+# 飞书 message_id 形如 om_xxx / om_x100b…，只允许这些字符直接拼进 URL path。
+_VALID_MESSAGE_ID = re.compile(r"[A-Za-z0-9_:-]{1,128}")
 
 _API = {"feishu": "https://open.feishu.cn/open-apis", "lark": "https://open.larksuite.com/open-apis"}
 
@@ -129,16 +133,21 @@ class RestClient:
 
     async def send_card_delivery(self, chat_id: str, card: dict[str, Any], **kwargs: Any) -> Any:
         token = await self._tenant_token()
-        body = {
-            "receive_id": chat_id,
-            "msg_type": "interactive",
-            "content": json.dumps(card, ensure_ascii=False),
-        }
-        for key in ("reply_to_message_id",):
-            if kwargs.get(key):
-                body["reply_message_id"] = kwargs[key]
-        data = await self._request_json("POST", "/im/v1/messages?receive_id_type=chat_id",
-                                        token=token, json_body=body)
+        content = json.dumps(card, ensure_ascii=False)
+        reply_to = str(kwargs.get("reply_to_message_id") or "")
+        if reply_to and _VALID_MESSAGE_ID.fullmatch(reply_to):
+            # 飞书的「回复」是独立端点 POST /im/v1/messages/{message_id}/reply。
+            # 早先这里往 create 的 body 里塞 reply_message_id —— 那不是官方字段，
+            # 飞书静默忽略，卡片照旧按发送时间落在最下面（reply 锚等于没生效）。
+            body: dict[str, Any] = {"msg_type": "interactive", "content": content}
+            if kwargs.get("reply_in_thread"):
+                body["reply_in_thread"] = True
+            data = await self._request_json(
+                "POST", f"/im/v1/messages/{reply_to}/reply", token=token, json_body=body)
+        else:
+            body = {"receive_id": chat_id, "msg_type": "interactive", "content": content}
+            data = await self._request_json("POST", "/im/v1/messages?receive_id_type=chat_id",
+                                            token=token, json_body=body)
 
         class _Result:
             success = True

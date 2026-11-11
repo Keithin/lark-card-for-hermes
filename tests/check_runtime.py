@@ -142,3 +142,35 @@ res = asyncio.run(flaky_adapter._send_streaming_card(CHAT, "正文", "om_trigger
 assert flaky.calls == ["om_trigger2", None], flaky.calls
 assert res.success and res.message_id == "om_card_unanchored"
 print("OK runtime: reply 锚失败自动无锚重试，卡片仍能发出")
+
+
+# ── reply 锚必须走飞书的 reply 端点（create 里塞 reply_message_id 会被静默忽略）────
+from hfc.client import RestClient  # noqa: E402
+
+
+class _RecordingRest(RestClient):
+    def __init__(self) -> None:
+        super().__init__("app", "secret", domain="feishu")
+        self.calls: list[tuple[str, str, dict]] = []
+
+    async def _tenant_token(self) -> str:          # 不联网
+        return "t-fake"
+
+    async def _request_json(self, method, path, *, token="", json_body=None):
+        self.calls.append((method, path, json_body or {}))
+        return {"data": {"message_id": "om_created"}}
+
+
+rest = _RecordingRest()
+asyncio.run(rest.send_card_delivery("oc_x", {"schema": "2.0"}, reply_to_message_id="om_trigger"))
+method, path, body = rest.calls[-1]
+assert method == "POST" and path == "/im/v1/messages/om_trigger/reply", (method, path)
+assert "receive_id" not in body and body["msg_type"] == "interactive", body
+assert body.get("reply_in_thread") is None, "默认不建话题串"
+assert json.loads(body["content"])["schema"] == "2.0"
+
+# 非法 id 不得拼进 path（退回普通发送）
+asyncio.run(rest.send_card_delivery("oc_x", {}, reply_to_message_id="../../evil"))
+assert rest.calls[-1][1] == "/im/v1/messages?receive_id_type=chat_id", rest.calls[-1]
+assert rest.calls[-1][2]["receive_id"] == "oc_x"
+print("OK runtime: reply 锚走 /im/v1/messages/<id>/reply，非法 id 退回普通发送")
