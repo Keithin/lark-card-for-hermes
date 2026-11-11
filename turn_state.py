@@ -135,6 +135,30 @@ class TurnRegistry:
                     if not t.final and t.platform == platform and t.chat_id == chat_id]
             return hits[0] if len(hits) == 1 else None
 
+    def adopt(self, *, platform: str, chat_id: str, thread_id: str = "",
+              max_age: float = 900.0) -> Optional[Turn]:
+        """投递侧认领：**唯一**活动回合时把它和这个 chat 绑起来。
+
+        用途：`post_gateway_admission` 不派发时，回合由 API/工具钩子建立（只带
+        session_id，没有 chat_id）。投递侧只有 chat_id，两边靠「本平台只剩一个
+        活动回合」对接；一旦认领就补齐 chat_id/thread_id，后续严格匹配即可命中。
+        多回合并发 / 回合太旧 → 返回 None，不赌。
+        """
+        with self._lock:
+            now = time.monotonic()
+            candidates = [t for t in self._by_key.values()
+                          if not t.final and t.platform == platform
+                          and now - t.started <= max_age
+                          and (not t.chat_id or t.chat_id == chat_id)]
+            if len(candidates) != 1:
+                return None
+            turn = candidates[0]
+            if not turn.chat_id:
+                turn.chat_id = str(chat_id or "")
+            if thread_id and not turn.thread_id:
+                turn.thread_id = str(thread_id or "")
+            return turn
+
     def bind_adapter(self, turn: Turn, adapter_token: str) -> bool:
         """第一个给这个 chat 投递的 adapter 拥有该回合；别的实例不接管。"""
         with self._lock:

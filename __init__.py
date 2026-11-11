@@ -642,10 +642,27 @@ def _on_stream_delta(delta: str = "", kind: str = "", session_id: str = "", plat
         _TURNS.thinking(_bridge_key(turn), delta)
 
 
+def _ensure_turn(platform: str = "", session_id: str = "") -> Optional["Turn"]:
+    """`post_gateway_admission` 不派发时，用真正会触发的钩子（API/工具）建回合。
+
+    回合的 chat_id 留空，等投递侧 `REGISTRY.adopt()` 认领时补齐——否则回合存在却
+    对不上任何 chat，footer 依旧只剩「已完成」。
+    """
+    plat = platform or "feishu"
+    turn = REGISTRY.resolve(platform=plat, session_id=session_id)
+    if turn is not None:
+        return turn
+    turn = REGISTRY.begin(platform=plat, session_key=str(session_id or ""))
+    REGISTRY.resolve(platform=plat, session_id=session_id)   # 绑定 session_id → turn
+    return turn
+
+
 def _on_post_api_request(usage: Any = None, model: str = "", provider: str = "",
                          session_id: str = "", platform: str = "", **_kw: Any) -> None:
     """HFC 的 footer 要 model/tokens/context；这些只有 API 层知道。"""
-    turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id)
+    if platform and platform != "feishu":
+        return
+    turn = _ensure_turn(platform, session_id)
     if turn is None:
         return
     if isinstance(usage, dict):
@@ -769,6 +786,13 @@ def _build_adapter_class(base: Any) -> type:
             """这个 chat/thread 是否属于本 adapter 的进行中回合（不是就返回 None）。"""
             thread_id = str((metadata or {}).get("thread_id") or "")
             turn = REGISTRY.for_chat(platform="feishu", chat_id=str(chat_id or ""), thread_id=thread_id)
+            if turn is None:
+                adopted = REGISTRY.adopt(platform="feishu", chat_id=str(chat_id or ""),
+                                         thread_id=thread_id)
+                if adopted is not None:
+                    logger.info("[feishu-card] turn adopted by delivery (id=%s chat=%s)",
+                                adopted.turn_id, chat_id)
+                    turn = adopted
             if turn is None:
                 # 严格 (chat, thread) 没命中：同 chat 唯一活动回合就认它（thread_id 两侧不一致时
                 # 否则整回合会被判成「回合外」，正常回复变成通知卡、footer 丢耗时/token）

@@ -181,11 +181,32 @@ def check_turn_lookup_fallback():
     assert reg.for_chat_loose(platform="feishu", chat_id="c9") is None
 
 
+def check_adopt_delivery():
+    """唯一活动回合可被投递侧认领；多回合/过旧不许赌。"""
+    from turn_state import TurnRegistry
+
+    reg = TurnRegistry()
+    t = reg.begin(platform="feishu", session_key="s1")        # 钩子建回合，chat 未知
+    adopted = reg.adopt(platform="feishu", chat_id="c1", thread_id="")
+    assert adopted is t and t.chat_id == "c1", "唯一候选应被认领并补上 chat_id"
+    assert reg.for_chat(platform="feishu", chat_id="c1", thread_id="") is t, "认领后严格匹配必须命中"
+
+    reg2 = TurnRegistry()
+    reg2.begin(platform="feishu", session_key="a")
+    reg2.begin(platform="feishu", session_key="b")
+    assert reg2.adopt(platform="feishu", chat_id="c1") is None, "多候选必须放弃"
+
+    reg3 = TurnRegistry()
+    old = reg3.begin(platform="feishu", session_key="old")
+    old.started -= 10000
+    assert reg3.adopt(platform="feishu", chat_id="c1", max_age=900) is None, "过旧回合不许认领"
+
+
 def main() -> int:
     for fn in (check_receipts, check_config_snapshot, check_notice_lifecycle, check_metrics,
                check_maintenance, check_rate, check_diagnostics, check_notice_same_delivery,
                check_error_sanitised, check_rate_peak_decays, check_state_dir_resolves_symlink,
-               check_turn_lookup_fallback):
+               check_turn_lookup_fallback, check_adopt_delivery):
         fn()
         print(f"ok {fn.__name__}")
     print("ops layer ok")
