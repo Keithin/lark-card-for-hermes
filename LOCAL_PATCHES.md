@@ -33,6 +33,30 @@
 判据：`tests/check_compat.py`（6 组）——预览兜底、结构修补命中、already_ok、真干活分支不改写、
 静态平台声明、静态命令注册表。`run_all.py` 13 → **15** 项。
 
+## 回合归属不再依赖 admission 钩子（1.7.13，实测定性）
+
+钩子探针证明：`post_gateway_admission` 在本版本**从不派发**（`pre_tool_call` /
+`post_tool_call` / `post_api_request` / `on_stream_delta` / `post_llm_call` /
+`on_session_end` 都正常触发）。于是回合登记换成真正会响的钩子，投递侧负责认领：
+
+| 环节 | 做法 |
+|---|---|
+| 建回合 | `_on_post_api_request` → `_ensure_turn()`（session_key = session_id），usage 直接挂上 |
+| 认领 | `TurnRegistry.adopt()`：本平台**恰好一个**活动回合且 15 分钟内才认领，并补 `chat_id`/`thread_id` |
+| 之后 | 严格 `for_chat()` 命中，整轮 `notice=0`；多回合/过期一律不认（不赌） |
+| 观测 | 每个钩子首次触发打 `hook fired: <name>`；`send` 打 metadata 键名；`edit` 打 `turn=` |
+
+实测（重启后一轮真实问答）：
+```
+09:03:39 hook fired: post_api_request
+09:03:40 turn adopted by delivery (id=d0ce7873… chat=oc_60db…)
+09:03:40 send … turn=d0ce7873… notice=0
+09:06:20 card_v2 text=7127 rendered=7127 segs=4 notice=0
+检查点：status=completed dur=47.6 model=cn:deepseek-v4.1-flash
+        tokens={input 563, output 905, cache_read 164992}
+```
+`notice=0` 54 帧、`notice=1` 仅启动通知 1 帧。
+
 ## 回合登记的两处硬化（1.7.12 后续）
 
 现场：重启后的某些回合仍被判成通知卡（`notice=1`），说明 `_turn_for` 连兜底都命不中——
