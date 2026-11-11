@@ -33,6 +33,18 @@
 判据：`tests/check_compat.py`（6 组）——预览兜底、结构修补命中、already_ok、真干活分支不改写、
 静态平台声明、静态命令注册表。`run_all.py` 13 → **15** 项。
 
+## 静态兜底的解析缺陷（1.7.11，自审发现）
+
+1.9 声称「动态录音失败 → AST 静态解析 register_platform」，实际是死代码：
+
+1. 上游把 `register()` 放在 `adapter.py`（不是 `__init__.py`），旧实现只读 `__init__.py` → 永远找不到；
+2. 真实声明里 kwargs 用 `**SEND_ENTRY_KWARGS` / `**DASHBOARD_CARD` / `**gateway_env.AUTHZ` 展开，旧实现见 `**` 直接返回 None。
+
+现在：扫描包内所有顶层模块找 `register()`；支持 `**mapping`（解析成 dict 后合并）、
+函数内相对 import（`from . import gateway_env` / `from .x import Y`）、位置参数。
+实测与动态录音**逐字段一致**（29 个键，`adapter_factory` 同一对象）。
+同一处还修了 glob 兜底顺序：原来放在候选之前且用 `**` 递归，白付 0.46s 启动时间；现在只在候选失败时做浅层 glob（0.002s）。
+
 ## 运行时状态移出插件目录（1.7.10）
 
 检查点目录从 `<插件>/state/` 改为 `$HERMES_HOME/state/lark-card-for-hermes/`（可用 `LARK_CARD_STATE_DIR` 覆盖），原因两条：

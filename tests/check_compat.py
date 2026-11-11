@@ -185,6 +185,35 @@ def check_static_registry(tmp: Path):
     assert entries[0]["source"] == "core-static"
 
 
+def check_dynamic_failure_uses_static():
+    """动态录音抛错时，静态解析必须真的接过注册声明（不是空实现）。"""
+    from compat import platform as cp
+
+    # 静态兜底与动态录音有同一个前置条件：内置插件包本身要能 import。
+    # 导不进来（例如测试用的 venv 里没有 `pm`）时两条路径同时不可用 → 跳过，不算失败。
+    try:
+        cp.adapter_module()
+    except Exception:
+        return
+    original = cp._RegistrationRecorder.register_platform
+
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("recorder exploded")
+
+    cp._RegistrationRecorder.register_platform = boom
+    try:
+        kwargs = cp.recorded_platform_kwargs()
+    finally:
+        cp._RegistrationRecorder.register_platform = original
+    assert kwargs, "动态失败后静态兜底也必须给出声明"
+    assert kwargs.get("name") == "feishu", kwargs.get("name")
+    assert "adapter_factory" in kwargs and "trusted_inbound" not in kwargs
+    # 与动态录音的字段集一致（同一份声明，只是解析路径不同）
+    dynamic = cp.recorded_platform_kwargs()
+    if dynamic:
+        assert set(kwargs) == set(dynamic), (sorted(set(dynamic) - set(kwargs)), sorted(set(kwargs) - set(dynamic)))
+
+
 def main() -> int:
     import tempfile
 
@@ -192,6 +221,7 @@ def main() -> int:
     check_structural_repair()
     check_already_ok()
     check_unsupported()
+    check_dynamic_failure_uses_static()
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         check_static_platform_kwargs(tmp)
