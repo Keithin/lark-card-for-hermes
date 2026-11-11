@@ -123,6 +123,18 @@ class TurnRegistry:
                     return turn
             return None
 
+    def for_chat_loose(self, *, platform: str, chat_id: str) -> Optional[Turn]:
+        """严格 (chat, thread) 没命中时的兜底：同 chat 恰好一个活动回合就用它。
+
+        触发场景：回合登记时带了 thread_id，而投递侧 metadata 里没有（或反之），
+        严格匹配会判成「回合外」→ 正常回复被当通知卡，footer 丢掉耗时/token。
+        只在**唯一**候选时生效；多候选（同 chat 多线程并发）仍返回 None，不赌。
+        """
+        with self._lock:
+            hits = [t for t in self._by_key.values()
+                    if not t.final and t.platform == platform and t.chat_id == chat_id]
+            return hits[0] if len(hits) == 1 else None
+
     def bind_adapter(self, turn: Turn, adapter_token: str) -> bool:
         """第一个给这个 chat 投递的 adapter 拥有该回合；别的实例不接管。"""
         with self._lock:

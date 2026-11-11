@@ -166,10 +166,26 @@ def check_state_dir_resolves_symlink():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_turn_lookup_fallback():
+    """thread_id 两侧不一致时不能把整回合判成「回合外」，但多候选时不许赌。"""
+    from turn_state import TurnRegistry
+
+    reg = TurnRegistry()
+    reg.begin(platform="feishu", session_key="s1", chat_id="c1", thread_id="t1", turn_id="a1")
+    assert reg.for_chat(platform="feishu", chat_id="c1", thread_id="") is None, "严格匹配本身不应放宽"
+    loose = reg.for_chat_loose(platform="feishu", chat_id="c1")
+    assert loose is not None and loose.turn_id == "a1", loose
+
+    reg.begin(platform="feishu", session_key="s2", chat_id="c1", thread_id="t2", turn_id="a2")
+    assert reg.for_chat_loose(platform="feishu", chat_id="c1") is None, "多候选必须放弃"
+    assert reg.for_chat_loose(platform="feishu", chat_id="c9") is None
+
+
 def main() -> int:
     for fn in (check_receipts, check_config_snapshot, check_notice_lifecycle, check_metrics,
                check_maintenance, check_rate, check_diagnostics, check_notice_same_delivery,
-               check_error_sanitised, check_rate_peak_decays, check_state_dir_resolves_symlink):
+               check_error_sanitised, check_rate_peak_decays, check_state_dir_resolves_symlink,
+               check_turn_lookup_fallback):
         fn()
         print(f"ok {fn.__name__}")
     print("ops layer ok")

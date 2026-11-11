@@ -703,7 +703,13 @@ def _build_adapter_class(base: Any) -> type:
             thread_id = str((metadata or {}).get("thread_id") or "")
             turn = REGISTRY.for_chat(platform="feishu", chat_id=str(chat_id or ""), thread_id=thread_id)
             if turn is None:
-                return None
+                # 严格 (chat, thread) 没命中：同 chat 唯一活动回合就认它（thread_id 两侧不一致时
+                # 否则整回合会被判成「回合外」，正常回复变成通知卡、footer 丢耗时/token）
+                loose = REGISTRY.for_chat_loose(platform="feishu", chat_id=str(chat_id or ""))
+                if loose is None:
+                    return None
+                logger.debug("[feishu-card] turn matched by chat only (thread=%r)", thread_id)
+                turn = loose
             if not REGISTRY.bind_adapter(turn, self._adapter_token):
                 return None      # 已被另一个 adapter 实例持有：不接管、不串卡
             return turn

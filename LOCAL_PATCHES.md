@@ -33,6 +33,21 @@
 判据：`tests/check_compat.py`（6 组）——预览兜底、结构修补命中、already_ok、真干活分支不改写、
 静态平台声明、静态命令注册表。`run_all.py` 13 → **15** 项。
 
+## 回合查找兜底（1.7.12，现场日志发现）
+
+实测日志：一整轮正常回复的每帧都是 `turn=-`，被判成回合外通知卡（`notice=1`），footer 因此没有耗时/token：
+
+```
+08:41:05 send ... turn=- len=600      ← 真实回合，但 turn 判定失败
+08:41:05 card_v2 text=600 notice=1
+08:41:09 edit mid=om_… len=1117       ← 后续帧仍在同一张「已完成」卡上流式
+```
+
+根因：`for_chat()` 要求 `(chat_id, thread_id)` **严格**匹配，两侧 thread_id 不一致（一侧有值一侧空）就返回 None。
+
+修法：新增 `TurnRegistry.for_chat_loose()` —— 严格匹配失败时，同 chat **恰好一个**活动回合才认它；
+多候选（同 chat 多线程并发）仍返回 None，不赌。命中时打 debug 日志。
+
 ## 自审后的收尾（1.7.11）
 
 随 P1/P2 一起修掉的 P2/P3：
