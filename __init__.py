@@ -1005,11 +1005,14 @@ def _build_adapter_class(base: Any) -> type:
                 _TURNS.answer_frame(key, text, create_notice=not live, fresh=fresh)
                 card = _TURNS.render(key, streaming=streaming)
             if card:
-                body_len = next((len(el.get("content", "")) for el in
-                                 card.get("body", {}).get("elements", [])
-                                 if el.get("element_id") == "main_content"), -1)
-                logger.info("[feishu-card] card_v2 text=%d rendered=%d notice=%d",
-                            len(text or ""), body_len, int(is_notice))
+                # 正文可能被 plan_main_content 拆成 main_content / main_content_1 …
+                # （含原生表格时第一段往往只有几十字的引导句），所以按前缀求和，
+                # 否则日志里的 rendered 会让人误以为内容丢了。
+                parts = [el for el in card.get("body", {}).get("elements", [])
+                         if str(el.get("element_id", "")).startswith("main_content")]
+                body_len = sum(len(el.get("content", "") or "") for el in parts)
+                logger.info("[feishu-card] card_v2 text=%d rendered=%d segs=%d notice=%d",
+                            len(text or ""), body_len, len(parts), int(is_notice))
                 return card
             return base._card(_card_title(), "blue", text or " ")
 
