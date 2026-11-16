@@ -608,6 +608,13 @@ def _sdk_models() -> dict[str, Any]:
     }
 
 
+# 选项穷尽的命令提问：卡片不加「其他…」——自由输入匹配不上任何选项，只会退回用法文本。
+# 提问串会带「当前：xxx」，所以按前缀匹配；其余 clarify 提问（agent 的开放/多选问题）照常带。
+_PRESET_QUESTION = "切换卡片阅读预设"
+_ACTIVITY_QUESTION = "切换实时工具显示"
+_CLOSED_CHOICE_PREFIXES = (_PRESET_QUESTION, _ACTIVITY_QUESTION)
+
+
 def _build_adapter_class(base: Any) -> type:
     class CardFeishuAdapter(base.FeishuAdapter):
         """Bundled Feishu adapter whose text messages are single, in-place-updated cards."""
@@ -651,8 +658,10 @@ def _build_adapter_class(base: Any) -> type:
                                    "clarify_choice": str(choice)})
                 for choice in choices
             ]
-            actions.append(base._card_button("其他…", "default",
-                                             {"hermes_clarify_action": "other", "clarify_id": clarify_id}))
+            # 选项穷尽的命令提问不加「其他…」（点了只会退回用法文本）；其余照常。
+            if not question.startswith(_CLOSED_CHOICE_PREFIXES):
+                actions.append(base._card_button("其他…", "default",
+                                                 {"hermes_clarify_action": "other", "clarify_id": clarify_id}))
             return base._card(_card_title(), "blue", question, actions=actions)
 
         async def send_clarify(self, chat_id: str, question: str, choices: Optional[list],
@@ -1182,8 +1191,13 @@ def _write_preset(preset: str, config_path: Optional[Path] = None) -> str:
     return name
 
 
+def _current_preset() -> str:
+    """当前阅读预设——用法文本、选择卡和成功回执都要显示它。"""
+    return str((_TURNS.config or {}).get("reading_preset") or "classic").strip().lower()
+
+
 def _preset_usage(note: str = "") -> str:
-    current = (_TURNS.config or {}).get("reading_preset", "classic")
+    current = _current_preset()
     head = f"{note}\n" if note else ""
     return (
         f"{head}用法：/card-preset <classic|focused|detailed|task>（当前：{current}）\n"
@@ -1198,12 +1212,13 @@ def _on_card_preset(raw_args: str) -> str:
     （命令本身的注册仍需一次重启才出现）。handler 必须自己接住所有异常：抛出去会被
     派发层当成「未处理」，把命令文本转给 agent。
     """
+    current = _current_preset()
     arg = (raw_args or "").strip()
     if not arg:
         picked = None
         try:
             from hermes_cli.plugin_choices import ask_choice
-            picked = ask_choice("切换卡片阅读预设", _PRESET_CHOICES)
+            picked = ask_choice(f"{_PRESET_QUESTION}（当前：{current}）", _PRESET_CHOICES)
         except Exception:
             logger.debug("[feishu-card] ask_choice unavailable; falling back to usage text", exc_info=True)
         if not picked:
@@ -1219,7 +1234,7 @@ def _on_card_preset(raw_args: str) -> str:
         return f"写入 config.json 失败：{exc}"
     with _TURNS_LOCK:
         _TURNS.config = load_card_config()
-    reply = f"✅ 卡片预设已切换到 {name}（已写入 config.json，下一条消息生效，无需重启）"
+    reply = f"✅ 卡片预设：{current} → {name}（已写入 config.json，下一条消息生效，无需重启）"
     _mark_command_reply("card-preset", reply)
     return reply
 
@@ -1250,8 +1265,13 @@ def _write_tool_activity(activity: str, config_path: Optional[Path] = None) -> s
     return name
 
 
+def _current_activity() -> str:
+    """当前实时工具显示档——用法文本、选择卡和成功回执都要显示它。"""
+    return str((_TURNS.config or {}).get("tool_activity") or "full").strip().lower()
+
+
 def _activity_usage(note: str = "") -> str:
-    current = (_TURNS.config or {}).get("tool_activity", "full")
+    current = _current_activity()
     head = f"{note}\n" if note else ""
     return (
         f"{head}用法：/card-activity <full|summary|hidden>（当前：{current}）\n"
@@ -1261,12 +1281,13 @@ def _activity_usage(note: str = "") -> str:
 
 def _on_card_activity(raw_args: str) -> str:
     """``/card-activity [名字]``：无参数弹选择菜单，有参数直接切换。"""
+    current = _current_activity()
     arg = (raw_args or "").strip()
     if not arg:
         picked = None
         try:
             from hermes_cli.plugin_choices import ask_choice
-            picked = ask_choice("切换实时工具显示", _ACTIVITY_CHOICES)
+            picked = ask_choice(f"{_ACTIVITY_QUESTION}（当前：{current}）", _ACTIVITY_CHOICES)
         except Exception:
             logger.debug("[feishu-card] ask_choice unavailable; falling back to usage text", exc_info=True)
         if not picked:
@@ -1282,7 +1303,7 @@ def _on_card_activity(raw_args: str) -> str:
         return f"写入 config.json 失败：{exc}"
     with _TURNS_LOCK:
         _TURNS.config = load_card_config()
-    reply = f"✅ 实时工具显示已切换到 {name}（已写入 config.json，下一条消息生效，无需重启）"
+    reply = f"✅ 实时工具显示：{current} → {name}（已写入 config.json，下一条消息生效，无需重启）"
     _mark_command_reply("card-activity", reply)
     return reply
 

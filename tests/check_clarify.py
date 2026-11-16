@@ -107,7 +107,22 @@ async def main() -> None:
     await adapter.send_clarify(CHAT, "随便说点什么", None, "cid-4", "sess-1")
     assert "actions" not in sent[-1], "无选项时不该发按钮卡"
 
-    print("OK clarify: 按钮卡 → 解析；其他 → 文字拦截；retire 改写；无选项走文字")
+    # 7) 选项穷尽的命令提问（/card-preset、/card-activity）不带「其他…」，其余照常带
+    def _labels(card: dict) -> list:
+        return [a["text"]["content"] for a in
+                [e for e in card["elements"] if e.get("tag") == "action"][0]["actions"]]
+
+    closed = adapter._clarify_card(f"{mod._PRESET_QUESTION}（当前：focused）",
+                                   ["classic", "focused"], "cid-5")
+    assert _labels(closed) == ["classic", "focused"], _labels(closed)
+    closed2 = adapter._clarify_card(f"{mod._ACTIVITY_QUESTION}（当前：summary）",
+                                    ["full", "summary", "hidden"], "cid-6")
+    assert _labels(closed2) == ["full", "summary", "hidden"], _labels(closed2)
+    assert _labels(adapter._clarify_card("选哪个方案？", ["A"], "cid-7")) == ["A", "其他…"]
+    assert all(a["value"]["clarify_id"] == "cid-5" for a in
+               [e for e in closed["elements"] if e.get("tag") == "action"][0]["actions"])
+
+    print("OK clarify: 按钮卡 → 解析；其他 → 文字拦截；retire 改写；无选项走文字；穷尽选项不带「其他…」")
 
 
 asyncio.run(main())

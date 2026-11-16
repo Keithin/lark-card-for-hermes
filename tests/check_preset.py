@@ -141,6 +141,37 @@ real_cfg = json.loads((PLUGIN.parent / "config.json").read_text(encoding="utf-8"
 assert real_cfg["card"]["reading_preset"] in ("classic", "task", "focused", "detailed")
 print("OK handler: 无 asker/非法输入均回用法文本，真实配置未被触碰")
 
+# ── 4. 选择卡的提问要带当前模式 ───────────────────────────────────────────────
+import hermes_cli.plugin_choices as pc  # noqa: E402
+
+_captured: list[str] = []
+_orig_ask = pc.ask_choice
+
+
+def _capture(question: str, choices: list):
+    _captured.append(question)
+    return None                      # 返回 None → handler 退回用法文本，不写盘
+
+
+pc.ask_choice = _capture
+try:
+    mod._on_card_preset("")
+    mod._on_card_activity("")
+finally:
+    pc.ask_choice = _orig_ask
+
+assert len(_captured) == 2, _captured
+_q_preset, _q_activity = _captured
+assert _q_preset.startswith(mod._PRESET_QUESTION) and "当前：" in _q_preset, _q_preset
+assert _q_activity.startswith(mod._ACTIVITY_QUESTION) and "当前：" in _q_activity, _q_activity
+# 显示的必须是真实配置值，不是硬编码默认
+_real_card = json.loads((PLUGIN.parent / "config.json").read_text(encoding="utf-8"))["card"]
+assert mod._current_preset() == _real_card["reading_preset"], mod._current_preset()
+assert mod._current_activity() == _real_card["tool_activity"], mod._current_activity()
+assert f"当前：{_real_card['reading_preset']}" in _q_preset, _q_preset
+assert f"当前：{_real_card['tool_activity']}" in _q_activity, _q_activity
+print(f"OK 提问带当前模式: {_q_preset!r} / {_q_activity!r}")
+
 
 class _FakeCtx:
     def __init__(self):
