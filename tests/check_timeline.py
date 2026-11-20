@@ -86,6 +86,37 @@ assert {t.turn_id: len(t.rows) for t in REGISTRY.active()} == counts, "多候选
 
 print("OK lark-cards self-check: 注册表时间线、并行同名工具、双 chat 隔离、收尾、折叠、多候选不猜")
 
+# 进度墙识别（core run_turn_progress 的动词/围栏格式）：正文不该吃它，答复也不该被吞
+LABELS = ("terminal", "read_file", "运行命令", "读取文件", "编辑", "搜索文件")
+wall = (
+    "💻 terminal\n```\nls -la ~/.hermes/scripts/ | grep -i s...\n```\n"
+    "📖 读取文件 hermes-selfcheck-report.py L520-639\n"
+    "📖 读取文件 hermes-selfcheck-report.py\n"
+    "🔧 编辑 /Users/personal/.hermes/scripts/herme... (×2)\n"
+    "💻 terminal\n```\ncd /tmp && cat > /tmp/test_cron_lock....\n```\n"
+    "🔎 搜索文件 · fire-\\.{|\\.fire-|fire_lock"
+)
+assert mod.looks_like_progress(wall, {}, LABELS), wall
+assert mod.looks_like_progress("📖 读取文件 jobs.py L350-419", {}, LABELS)
+# 连续 terminal 省掉表头：只有围栏，靠上一帧状态认
+fence_only = "```\ngrep -rn \"\\.fire-\" ~/.hermes\n```"
+assert not mod.looks_like_progress(fence_only, {}, LABELS)
+assert mod.looks_like_progress(fence_only, {}, LABELS, True)
+# 答复不能被吞
+for answer in ("✅ 已完成", "📊 昨日 GSV 82.6 万，环比 +12%", "```\n这是答复里的代码块\n```"):
+    assert not mod.looks_like_progress(answer, {}, LABELS), answer
+
+print("OK progress chrome: core 动词/围栏进度行进时间线，短答复与代码块答复仍进正文")
+
+# 流式帧里的「答复 + --- + 进度覆盖层」：正文只留答复
+assert mod._strip_gateway_progress(wall, LABELS) == ""
+overlay = f"## 结论\n\n锁文件堆积是根因。\n\n---\n{wall}"
+assert mod._strip_gateway_progress(overlay, LABELS) == "## 结论\n\n锁文件堆积是根因。"
+kept = "第一段\n\n---\n\n第二段（答复里的水平线）"
+assert mod._strip_gateway_progress(kept, LABELS) == kept, kept
+assert mod._strip_gateway_progress("直接一句答复", LABELS) == "直接一句答复"
+print("OK stream overlay: 流式帧的工具进度覆盖层不进正文，答复里的 --- 原样保留")
+
 # 只剩一个活动回合时，无归属事件才被接受
 only = REGISTRY.active()[-1] if REGISTRY.active() else None
 for t in list(REGISTRY.active()):

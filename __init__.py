@@ -566,10 +566,118 @@ def merge_segment(segments: list[str], text: str) -> list[str]:
     return [*segments, text]
 
 
-def looks_like_progress(text: str, known_lines: dict[str, int]) -> bool:
-    """整段每一行都是我们自己生成的工具行 = 工具进度气泡的 send/edit。"""
+def looks_like_progress(
+    text: str,
+    known_lines: dict[str, int],
+    labels: tuple[str, ...] = (),
+    bare_fence: bool = False,
+) -> bool:
+    """整段都是工具进度气泡 = 正文不该吃它。
+
+    core 的 ``run_turn_progress`` 会把进度行用本地化动词/工具名重排（「📖 读取文件 …」、
+    「💻 terminal」+ 代码围栏），和本插件 ``format_tool_event`` 的文案不同，只比对
+    ``known_lines`` 匹配不上 —— 那一整堵进度墙就会落进卡片正文。``labels`` 是这一回合出现过的
+    工具名+动词，用来兜住这类行；``bare_fence`` 收「连续 terminal 省掉表头、只剩围栏」的帧。
+    """
     lines = [line for line in (text or "").splitlines() if line.strip()]
-    return bool(lines) and all(line in known_lines for line in lines)
+    if not lines:
+        return False
+    if all(line in known_lines for line in lines):
+        return True
+    matched = 0
+    fenced = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        if stripped in known_lines or _is_progress_line(stripped, labels):
+            matched += 1
+            continue
+        return False
+    return matched > 0 or bare_fence
+
+
+def _is_progress_line(line: str, labels: tuple[str, ...]) -> bool:
+    """``<emoji> <工具名或本地化动词> …`` = core 的进度行，不是答复正文。
+
+    前缀必须是 emoji（不含 ASCII 字母数字），这样「✅ 已完成」「📊 数据如下」这类短答复不会被吞。
+    """
+    head, _, rest = str(line or "").partition(" ")
+    if not head or any(ch.isascii() and ch.isalnum() for ch in head):
+        return False
+    return any(rest.startswith(label) for label in labels)
+
+
+def _strip_gateway_progress(text: str, labels: tuple[str, ...]) -> str:
+    """丢掉 core 流式帧里的工具进度覆盖层。
+
+    ``gateway/stream_consumer.py`` 的帧正文是「答复 + ``\\n\\n---\\n`` + 进度行」；答复为空时整帧
+    只有进度行。卡片自己有 header/时间线/工具块，正文再吃一份就是那堵进度墙（2026-11-20 用户截图）。
+    只在尾部确实像进度行时才切，答复里的水平线不受影响。
+    """
+    body = str(text or "")
+    if not body.strip():
+        return body
+    head, separator, tail = body.rpartition("\n\n---\n")
+    if separator and looks_like_progress(tail, {}, labels, True):
+        return head
+    if looks_like_progress(body, {}, labels, True):
+        return ""
+    return body
+
+
+_CORE_PROGRESS_LABELS: Optional[tuple[str, ...]] = None
+
+
+def _core_progress_labels() -> tuple[str, ...]:
+    """core 的进度行只可能是「emoji + 内置工具名」或「emoji + 本地化动词」。
+
+    shortcut: 读 core 的私有 ``_TOOL_VERB_TOOLS``；它改名就退回只认工具名（进度行照样能认），
+    届时再跟上游公开接口。
+    """
+    global _CORE_PROGRESS_LABELS
+    if _CORE_PROGRESS_LABELS is not None:
+        return _CORE_PROGRESS_LABELS
+    labels: set[str] = set()
+    try:
+        from agent.display import _TOOL_VERB_TOOLS, get_tool_verb
+        labels.update(str(name) for name in _TOOL_VERB_TOOLS)
+    except Exception:
+        _CORE_PROGRESS_LABELS = ()
+        return _CORE_PROGRESS_LABELS
+    for name in sorted(labels):
+        try:
+            verb = get_tool_verb(name)
+        except Exception:
+            verb = None
+        if verb:
+            labels.add(str(verb))
+    _CORE_PROGRESS_LABELS = tuple(sorted(labels))
+    return _CORE_PROGRESS_LABELS
+
+
+def progress_labels(turn: Optional["Turn"]) -> tuple[str, ...]:
+    """认出进度行用的标签：内置工具名+动词，加上本回合出现过的工具名（插件/MCP 工具）。"""
+    names = {str(row.get("name") or "") for row in (getattr(turn, "rows", None) or [])}
+    names.discard("")
+    labels = set(_core_progress_labels()) | names
+    if not labels:
+        return ()
+    try:
+        from agent.display import get_tool_verb
+    except Exception:
+        return tuple(sorted(labels))
+    for name in names:
+        try:
+            verb = get_tool_verb(name)
+        except Exception:
+            verb = None
+        if verb:
+            labels.add(str(verb))
+    return tuple(sorted(labels))
 
 
 def _bundled_feishu():
@@ -624,6 +732,7 @@ def _build_adapter_class(base: Any) -> type:
             self._card_messages: set[str] = set()      # v1 cards we own (PATCH path)
             self._card_streams: dict[str, dict] = {}   # message_id -> {card_id, element_id: text}
             self._tool_lines: dict[str, int] = {}      # 我们生成的工具行（用于识别进度气泡）
+            self._last_progress_frame = False          # 上一帧是工具进度（连续围栏块据此识别）
             self._turn_card: dict[str, tuple[float, str]] = {}   # chat_id -> (turn_started, message_id)
             self._segments: dict[str, list[str]] = {}  # message_id -> 答复正文段
             self._dead_remap: dict[str, str] = {}      # 坏卡 message_id -> 顶替它的新消息
@@ -935,7 +1044,15 @@ def _build_adapter_class(base: Any) -> type:
                     or _delivery_policy().decide(chat_id).disposition == NATIVE_DISPOSITION):
                 return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
             turn = self._turn_for(chat_id, metadata)
-            is_progress = MERGE_TOOL_CARD and looks_like_progress(formatted, self._tool_lines)
+            if turn is not None and not turn.final:
+                cleaned = _strip_gateway_progress(content, progress_labels(turn))
+                if cleaned != content:
+                    formatted = self.format_message(cleaned) if cleaned.strip() else ""
+            is_progress = MERGE_TOOL_CARD and looks_like_progress(
+                formatted, self._tool_lines, progress_labels(turn),
+                self._last_progress_frame,
+            )
+            self._last_progress_frame = bool(is_progress)
             logger.info("[feishu-card] send chat=%s turn=%s len=%d progress=%s known=%d",
                         chat_id, (turn.turn_id if turn else "-"), len(formatted), is_progress,
                         len(self._tool_lines))
@@ -1037,9 +1154,14 @@ def _build_adapter_class(base: Any) -> type:
         ):
             text = self.format_message(content)
             turn = self._turn_for(chat_id)
+            if turn is not None and not turn.final:
+                cleaned = _strip_gateway_progress(content, progress_labels(turn))
+                if cleaned != content:
+                    text = self.format_message(cleaned) if cleaned.strip() else ""
             message_id = self._dead_remap.get(message_id, message_id)  # 上一帧顶替过的新消息
             if (MERGE_TOOL_CARD and message_id == self._turn_card_id(chat_id, turn)
-                    and looks_like_progress(text, self._tool_lines)):
+                    and looks_like_progress(text, self._tool_lines,
+                                            progress_labels(turn), self._last_progress_frame)):
                 text = ""   # 进度帧只刷时间线：正文由 HFC session 自己保有
             logger.info("[feishu-card] edit mid=%s len=%d finalize=%s blanked=%s",
                         message_id, len(text), finalize, not text)
