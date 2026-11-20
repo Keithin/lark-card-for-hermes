@@ -82,8 +82,29 @@ def main() -> None:
     failed_body = body_text(render_card(finished, hide_successful_tool_activity=True))
     assert "执行命令" in failed_body, f"failed 卡应保留失败工具行: {failed_body}"
 
+    # 完成卡：标题取回复首行（不是配置里的固定名）；所有工具调用折进一个代码块。
+    done = make_live_session()
+    done.status = "completed"
+    done.answer_text = "💭 **推理：**\n```\n内部推理内容不该进标题\n```\n\n锁文件堆积是根因，已修。\n\n后面还有正文"
+    for ordinal, tool in enumerate(("terminal", "read_file"), start=1):
+        done.timeline.record_tool(
+            name=tool, tool_id=f"tt{ordinal}", status="completed",
+            detail=f"{tool} 详情\n耗时: 12ms",
+        )
+    done_card = render_card(done)
+    title = done_card["header"]["title"]["content"]
+    assert title.startswith("✅ 锁文件堆积是根因"), title
+    assert "内部推理内容" not in title, title
+    fenced = "\n".join(
+        [el.get("content", "") for el in done_card["body"]["elements"]]
+        + [sub.get("content", "") for el in done_card["body"]["elements"]
+           for sub in el.get("elements", []) or []]
+    )
+    assert fenced.count("```text") == 1, fenced          # 一个代码块，不是一行一个工具
+    assert "terminal · #1" in fenced and "read_file · #2" in fenced, fenced
+
     print("OK tool_activity: full shows tools, summary shows progress only, hidden shows nothing live, "
-          "focused hides failed rows once completed")
+          "focused hides failed rows once completed, completed title = reply headline, tools in one block")
 
 
 if __name__ == "__main__":

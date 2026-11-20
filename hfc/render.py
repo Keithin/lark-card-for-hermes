@@ -50,6 +50,10 @@ MAIN_CONTENT_CHUNK_CHARS = 2400
 DEFAULT_TITLE = "Hermes Agent"
 RUNTIME_HEADER_MAX_CHARS = 120
 CARD_QUOTE_SUMMARY_MAX_CHARS = 120
+# The finished card's title is the reply's first line: short enough to leave room for the
+# tool count and duration that follow it on the same line.
+_HEADER_HEADLINE_MAX_CHARS = 24
+_HEADER_RULE_RE = re.compile(r"[|\-:\s=]+")
 TEXT_SIZE_ROLE_ORDER = ("body", "reasoning", "tool", "notice", "footer")
 MODEL_COLOR_PREFIXES = (
     (("gpt-", "o1", "o3"), "blue"),
@@ -1079,6 +1083,29 @@ def _header_action_text(
     return _latest_running_action_text(session)
 
 
+def _answer_headline(session: CardSession) -> str:
+    """First real line of the reply, for the finished card's title.
+
+    Skips the ``💭 推理：`` prepend and everything inside its fence — that is the model's working,
+    not the answer — plus markdown markers and table rules.
+    """
+    fenced = False
+    for raw in str(session.answer_text or "").splitlines():
+        line = raw.strip()
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced or not line or line.startswith(("💭", "|", ">", "#")):
+            continue
+        line = " ".join(line.replace("**", "").replace("`", "").split())
+        if len(line) < 2 or _HEADER_RULE_RE.fullmatch(line):
+            continue
+        if len(line) <= _HEADER_HEADLINE_MAX_CHARS:
+            return line
+        return line[: _HEADER_HEADLINE_MAX_CHARS - 1].rstrip() + "…"
+    return ""
+
+
 def _header_title_with_state(
     session: CardSession,
     configured_title: str,
@@ -1101,7 +1128,11 @@ def _header_title_with_state(
         return _sanitize_runtime_header(interaction.prompt) or configured_title
     metrics = _runtime_header_metrics(session, display_status=display_status)
     if display_status == "completed":
-        return f"✅ {configured_title}" + (f" · {metrics}" if metrics else "")
+        # Local change 2026-11-20 (禹钊): the title used to be the same configured name on every
+        # card, so finished cards were indistinguishable ("之前 HFC 的标题会根据回复内容修改").
+        # The reply's first real line now leads, and the name survives as the fallback.
+        headline = _answer_headline(session) or configured_title
+        return f"✅ {headline}" + (f" · {metrics}" if metrics else "")
     if display_status == "failed":
         # Maintainer note (contract change): this used to collapse to "⛔ <name>", which hid where
         # the run stopped. The metrics stay for that reason; the action phrase moved to the
@@ -2218,6 +2249,12 @@ def _render_timeline_elements(
     folded = max(0, len(all_entries) - len(entries))
     panel_elements: list[Dict[str, Any]] = []
     reasoning_elements: list[Dict[str, Any]] = []
+    # Local change 2026-11-20 (禹钊): every tool call of the turn goes into ONE fenced code block
+    # the way reasoning does, instead of one rich-text row per call ("工具调用过程还是全部展示…
+    # 希望能像推理过程一样折叠在一个代码块中"). Lines are collected in panel order and the block
+    # takes the slot of the first (newest) tool entry.
+    tool_block_lines: list[str] = []
+    tool_block_at: Optional[int] = None
     # NEWEST FIRST — for the PANEL. The user asked for the panel to read in reverse order so the most
     # recent work is the first thing they see ("Timeline 最好倒序一下 阅读上能够看最近的比较方便"). A live
     # log's useful end is its LAST entry, and this panel is appended to the bottom of a card that is
@@ -2304,29 +2341,23 @@ def _render_timeline_elements(
                 )[0] if tool is not None else None
                 if current_detail == full_detail:
                     rendered_tool_ids.add(item.tool_id)
-            panel_elements.extend(
-                _timeline_markdown_elements(
-                    _render_tool_timeline_row(
-                        item.title,
-                        ("interrupted" if not live and str(item.status).strip().lower()
-                         not in TERMINAL_TOOL_STATUSES | {"display_handoff", "display_receipt"}
-                         else item.status),
-                        detail,
-                        duration,
-                        # The panel row carries the same #N tally as the content-area row, so the
-                        # two can be matched up. Resolved from the live tool state (the timeline
-                        # entry itself does not track an ordinal).
-                        ordinal=_timeline_tool_ordinal(session, item),
-                    ),
-                    f"auxiliary_timeline_toolentry_{index}",
-                    text_size=_role_text_size(
-                        text_sizes,
-                        "tool",
-                        default="x-small",
-                        used_roles=used_text_size_roles,
-                    ),
+            tool_block_lines.append(
+                _tool_block_line(
+                    item.title,
+                    ("interrupted" if not live and str(item.status).strip().lower()
+                     not in TERMINAL_TOOL_STATUSES | {"display_handoff", "display_receipt"}
+                     else item.status),
+                    detail,
+                    duration,
+                    # The panel row carries the same #N tally as the content-area row, so the
+                    # two can be matched up. Resolved from the live tool state (the timeline
+                    # entry itself does not track an ordinal).
+                    ordinal=_timeline_tool_ordinal(session, item),
                 )
             )
+            if tool_block_at is None:
+                tool_block_at = len(panel_elements)
+                panel_elements.append({})
         elif item.kind == "subagent":
             detail = _limit_text(
                 normalize_stream_text(item.detail),
@@ -2370,6 +2401,21 @@ def _render_timeline_elements(
                     ),
                 )
             )
+    if tool_block_lines:
+        # One fenced block for the whole tool log, so the panel reads as two things only:
+        # the reasoning it already had, and the tools — not a wall of coloured rows.
+        body = "\n".join(tool_block_lines)
+        fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", body)), default=0))
+        panel_elements[tool_block_at or 0: (tool_block_at or 0) + 1] = _timeline_markdown_elements(
+            f"{fence}text\n{body}\n{fence}",
+            "auxiliary_timeline_toolblock",
+            text_size=_role_text_size(
+                text_sizes,
+                "tool",
+                default="x-small",
+                used_roles=used_text_size_roles,
+            ),
+        )
     if folded:
         # The folded entries are the EARLIEST ones, and the panel now reads newest-first — so the line
         # that stands for them belongs at the BOTTOM, below the oldest entry still shown. Emitting it
@@ -2535,6 +2581,19 @@ def _render_tool_timeline_row(
         safe_line = html.escape(line, quote=False)
         lines.append(f'<font color="grey">　{safe_line}</font>')
     return "\n".join(lines)
+
+
+def _tool_block_line(
+    title: str,
+    status: str,
+    detail: str,
+    duration: str,
+    ordinal: int = 0,
+) -> str:
+    """One line of the tool code block: the same row, minus rich text (a fence renders no HTML)."""
+    row = _render_tool_timeline_row(title, status, detail, duration, ordinal)
+    row = re.sub(r'<font color="\w+">\s*|</font>', "", row)
+    return html.unescape(row).replace("**", "").replace("　", "  ")
 
 
 def _render_subagent_timeline_row(title: str, status: str, detail: str) -> str:
