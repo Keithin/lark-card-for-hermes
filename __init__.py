@@ -646,8 +646,9 @@ def _core_progress_labels() -> tuple[str, ...]:
         from agent.display import _TOOL_VERB_TOOLS, get_tool_verb
         labels.update(str(name) for name in _TOOL_VERB_TOOLS)
     except Exception:
-        _CORE_PROGRESS_LABELS = ()
-        return _CORE_PROGRESS_LABELS
+        # 不缓存失败：插件在 gateway 启动早期就会调用一次，那时 agent.display 可能还没可导入，
+        # 缓存成 () 会让之后所有进度行都认不出来（2026-11-24 实测的墙卡就是这个）。
+        return ()
     for name in sorted(labels):
         try:
             verb = get_tool_verb(name)
