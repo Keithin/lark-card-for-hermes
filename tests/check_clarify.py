@@ -70,6 +70,8 @@ async def main() -> None:
     actions = [e for e in card["elements"] if e.get("tag") == "action"][0]["actions"]
     labels = [a["text"]["content"] for a in actions]
     assert labels == ["方案A", "方案B"], labels
+    # 首选项上色，其余 default：不然一排全灰，看不出主次
+    assert [a["type"] for a in actions] == ["primary", "default"], actions
     assert all(a["value"]["clarify_id"] == "cid-1" for a in actions), actions
 
     # 2) 点「方案B」

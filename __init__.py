@@ -771,11 +771,13 @@ def _build_adapter_class(base: Any) -> type:
         def _clarify_card(self, question: str, choices: list, clarify_id: str) -> dict:
             # 只有选项按钮：不加「其他…」。直接打字本来就能答（数字/选项原文会解析，其他内容
             # 按普通消息路由），多一个按钮只是噪音。
+            # 首选项用 primary 上色（clarify 的 choices 本就 best-first，第一项带「推荐」后缀），
+            # 其余 default：卡片上才看得出主次，全是 default 会一片灰。
             actions = [
-                base._card_button(str(choice), "default",
+                base._card_button(str(choice), "primary" if index == 0 else "default",
                                   {"hermes_clarify_action": "choice", "clarify_id": clarify_id,
                                    "clarify_choice": str(choice)})
-                for choice in choices
+                for index, choice in enumerate(choices)
             ]
             return base._card(_card_title(), "blue", question, actions=actions)
 
