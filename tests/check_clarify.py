@@ -126,7 +126,31 @@ async def main() -> None:
     assert all(a["value"]["clarify_id"] == "cid-5" for a in
                [e for e in closed["elements"] if e.get("tag") == "action"][0]["actions"])
 
-    print("OK clarify: 按钮卡 → 解析；无「其他…」；retire 改写；无选项走文字")
+    # 8) 点击回执：整卡回执 + 即时 toast（客户端重渲染慢时，点击者先看到反馈）
+    class _Toast:
+        def __init__(self):
+            self.type = self.content = None
+
+    class _CardObj:
+        def __init__(self):
+            self.type = self.data = None
+
+    class _Resp:
+        def __init__(self):
+            self.toast = self.card = None
+
+    base.P2CardActionTriggerResponse, base.CallBackCard, base.CallBackToast = _Resp, _CardObj, _Toast
+    await adapter.send_clarify(CHAT, "再选一个", ["甲", "乙"], "cid-8", "sess-1")
+    resp = adapter._on_card_action_trigger(SimpleNamespace(event=SimpleNamespace(
+        operator=SimpleNamespace(open_id="ou_test"),
+        action=SimpleNamespace(value={"hermes_clarify_action": "choice",
+                                      "clarify_id": "cid-8", "clarify_choice": "甲"}))))
+    await asyncio.sleep(0)
+    assert resp.toast.content == "已选择：甲", resp.toast.content
+    assert resp.card.type == "raw" and resp.card.data["elements"], "回执必须带上冻结后的卡"
+    assert resolved[-1] == ("cid-8", "甲"), resolved
+
+    print("OK clarify: 按钮卡 → 解析；无「其他…」；首项上色；点击回执+toast；retire 改写；无选项走文字")
 
 
 asyncio.run(main())

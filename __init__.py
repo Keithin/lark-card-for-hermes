@@ -857,6 +857,7 @@ def _build_adapter_class(base: Any) -> type:
                 return self._card_response()
 
         def _handle_clarify_card_action(self, *, event: Any, action_value: dict[str, Any], loop: Any) -> Any:
+            started = time.monotonic()
             clarify_id = str(action_value.get("clarify_id") or "")
             state = self._clarify_state.get(clarify_id)
             if not state:
@@ -865,6 +866,7 @@ def _build_adapter_class(base: Any) -> type:
             checked = _validate_card_click(self, event=event, state=state, label="clarify", ident=clarify_id)
             if checked is None:
                 return self._card_response()
+            validated = time.monotonic()
             choice = str(action_value.get("clarify_choice") or "")
             if not choice:
                 return self._card_response()
@@ -886,7 +888,16 @@ def _build_adapter_class(base: Any) -> type:
             if not self._submit_on_loop(loop, self._resolve_clarify(
                     clarify_id=clarify_id, choice=choice, chat_id=state.get("chat_id", ""))):
                 return self._card_response()
-            return self._card_response(self._clarify_receipt(clarify_id, choice, state))
+            response = self._card_response(self._clarify_receipt(clarify_id, choice, state))
+            # 即时 toast：整卡回执在客户端重渲染要上百毫秒到 1s+，点击者先看到反馈，
+            # 卡片随后落到「已选择」。
+            if response is not None and getattr(base, "CallBackToast", None) is not None:
+                response.toast = base.CallBackToast()
+                response.toast.type, response.toast.content = "success", f"已选择：{choice}"
+            logger.info(
+                "[feishu-card] clarify 点击处理 validate=%.1fms total=%.1fms choice=%s",
+                (validated - started) * 1000, (time.monotonic() - started) * 1000, choice)
+            return response
 
         def _clarify_receipt(self, clarify_id: str, label: str, state: dict) -> dict:
             """点完的按钮卡冻结成静态回执：只留文字、不留控件。
