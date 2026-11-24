@@ -716,11 +716,19 @@ def _sdk_models() -> dict[str, Any]:
     }
 
 
-# 选项穷尽的命令提问：卡片不加「其他…」——自由输入匹配不上任何选项，只会退回用法文本。
-# 提问串会带「当前：xxx」，所以按前缀匹配；其余 clarify 提问（agent 的开放/多选问题）照常带。
+# 命令提问串会带「当前：xxx」，命令侧按前缀拼装，clarify 卡不再按提问串做特判。
 _PRESET_QUESTION = "切换卡片阅读预设"
 _ACTIVITY_QUESTION = "切换实时工具显示"
-_CLOSED_CHOICE_PREFIXES = (_PRESET_QUESTION, _ACTIVITY_QUESTION)
+
+
+def _validate_card_click(adapter: Any, **kwargs: Any) -> Any:
+    """点卡校验：上游 0.2x 把 adapter 上的 `_validate_card_action` 搬到了 `cards.authz`，
+    方法一消失点击就 AttributeError、按钮点了没反应。两处都认。"""
+    legacy = getattr(adapter, "_validate_card_action", None)
+    if callable(legacy):
+        return legacy(**kwargs)
+    from plugins.platforms.feishu.cards import validate_card_action
+    return validate_card_action(adapter, **kwargs)
 
 
 def _build_adapter_class(base: Any) -> type:
@@ -758,19 +766,17 @@ def _build_adapter_class(base: Any) -> type:
             return f"feishu:{chat_id}:{thread_id}"
 
         # ── clarify 按钮卡 ──────────────────────────────────────────────────────
-        # 照内置审批卡的线程模型（同步回调 + _submit_on_loop + _card_response）和 _validate_card_action
-        # 校验，不另造一套；按钮点击最终落到 tools.clarify_gateway.resolve_gateway_clarify。
+        # 照内置审批卡的线程模型（同步回调 + _submit_on_loop + _card_response）和卡片点击校验
+        # （_validate_card_click），不另造一套；按钮点击最终落到 tools.clarify_gateway.resolve_gateway_clarify。
         def _clarify_card(self, question: str, choices: list, clarify_id: str) -> dict:
+            # 只有选项按钮：不加「其他…」。直接打字本来就能答（数字/选项原文会解析，其他内容
+            # 按普通消息路由），多一个按钮只是噪音。
             actions = [
                 base._card_button(str(choice), "default",
                                   {"hermes_clarify_action": "choice", "clarify_id": clarify_id,
                                    "clarify_choice": str(choice)})
                 for choice in choices
             ]
-            # 选项穷尽的命令提问不加「其他…」（点了只会退回用法文本）；其余照常。
-            if not question.startswith(_CLOSED_CHOICE_PREFIXES):
-                actions.append(base._card_button("其他…", "default",
-                                                 {"hermes_clarify_action": "other", "clarify_id": clarify_id}))
             return base._card(_card_title(), "blue", question, actions=actions)
 
         async def send_clarify(self, chat_id: str, question: str, choices: Optional[list],
@@ -854,31 +860,31 @@ def _build_adapter_class(base: Any) -> type:
             if not state:
                 logger.debug("[feishu-card] clarify %s 已解析或未知", clarify_id)
                 return self._card_response()
-            checked = self._validate_card_action(event=event, state=state, label="clarify", ident=clarify_id)
+            checked = _validate_card_click(self, event=event, state=state, label="clarify", ident=clarify_id)
             if checked is None:
                 return self._card_response()
-            choice = action_value.get("clarify_choice")
-            if choice:
-                # HFC 的输入解码层：只接受卡片上真实给出过的选项，防止被篡改成任意值注入
-                try:
-                    from tools.clarify_gateway import get_pending
+            choice = str(action_value.get("clarify_choice") or "")
+            if not choice:
+                return self._card_response()
+            # HFC 的输入解码层：只接受卡片上真实给出过的选项，防止被篡改成任意值注入
+            try:
+                from tools.clarify_gateway import get_pending
 
-                    allowed = [str(c) for c in (getattr(get_pending(clarify_id), "choices", None) or [])]
-                    if allowed:
-                        choice = parse_choice(
-                            {"choice": choice}, {}, mode="single",
-                            allowed_values=allowed, allow_custom_input=False,
-                        ).value
-                except InteractionInputError:
-                    logger.warning("[feishu-card] clarify 收到不在选项里的点击，已忽略: %r", choice)
-                    return self._card_response()
-                except Exception:
-                    pass   # 取不到待答项（已超时等）：沿用原值，不因此吞掉点击
+                allowed = [str(c) for c in (getattr(get_pending(clarify_id), "choices", None) or [])]
+                if allowed:
+                    choice = parse_choice(
+                        {"choice": choice}, {}, mode="single",
+                        allowed_values=allowed, allow_custom_input=False,
+                    ).value
+            except InteractionInputError:
+                logger.warning("[feishu-card] clarify 收到不在选项里的点击，已忽略: %r", choice)
+                return self._card_response()
+            except Exception:
+                pass   # 取不到待答项（已超时等）：沿用原值，不因此吞掉点击
             if not self._submit_on_loop(loop, self._resolve_clarify(
                     clarify_id=clarify_id, choice=choice, chat_id=state.get("chat_id", ""))):
                 return self._card_response()
-            label = f"其他…（请直接回复）" if not choice else str(choice)
-            return self._card_response(self._clarify_receipt(clarify_id, label, state))
+            return self._card_response(self._clarify_receipt(clarify_id, choice, state))
 
         def _clarify_receipt(self, clarify_id: str, label: str, state: dict) -> dict:
             """点完的按钮卡冻结成静态回执：只留文字、不留控件。
@@ -902,13 +908,10 @@ def _build_adapter_class(base: Any) -> type:
             return static_legacy_receipt({**source, "elements": elements})
 
         async def _resolve_clarify(self, *, clarify_id: str, choice: Any, chat_id: str) -> None:
-            from tools.clarify_gateway import mark_awaiting_text, resolve_gateway_clarify
+            from tools.clarify_gateway import resolve_gateway_clarify
 
             self._clarify_state.pop(clarify_id, None)
-            if choice:
-                resolve_gateway_clarify(clarify_id, str(choice))
-            else:
-                mark_awaiting_text(clarify_id)
+            resolve_gateway_clarify(clarify_id, str(choice))
 
         async def retire_clarify_card(self, clarify_id: str, notice: str = "") -> None:
             """网关在超时/被取代时调：把按钮换成失效提示，别留一张点不动的卡。"""
