@@ -1099,10 +1099,11 @@ def _build_adapter_class(base: Any) -> type:
                     or _delivery_policy().decide(chat_id).disposition == NATIVE_DISPOSITION):
                 return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
             turn = self._turn_for(chat_id, metadata)
-            if turn is not None and not turn.final:
-                cleaned = _strip_gateway_progress(content, progress_labels(turn))
-                if cleaned != content:
-                    formatted = self.format_message(cleaned) if cleaned.strip() else ""
+            # 不按回合门控：流式帧常常解析不到回合（另一个 adapter 实例持有），
+            # 门控住就等于把工具栏原样写进正文（2026-11-26 实测）。
+            cleaned = _strip_gateway_progress(content, progress_labels(turn))
+            if cleaned != content:
+                formatted = self.format_message(cleaned) if cleaned.strip() else ""
             is_progress = MERGE_TOOL_CARD and looks_like_progress(
                 formatted, self._tool_lines, progress_labels(turn),
                 self._last_progress_frame,
@@ -1209,10 +1210,12 @@ def _build_adapter_class(base: Any) -> type:
         ):
             text = self.format_message(content)
             turn = self._turn_for(chat_id)
-            if turn is not None and not turn.final:
-                cleaned = _strip_gateway_progress(content, progress_labels(turn))
-                if cleaned != content:
-                    text = self.format_message(cleaned) if cleaned.strip() else ""
+            chrome_labels = progress_labels(turn)
+            cleaned = _strip_gateway_progress(content, chrome_labels)
+            if cleaned != content:
+                text = self.format_message(cleaned) if cleaned.strip() else ""
+                logger.info("[feishu-card] edit chrome stripped labels=%d turn=%s",
+                            len(chrome_labels), bool(turn))
             message_id = self._dead_remap.get(message_id, message_id)  # 上一帧顶替过的新消息
             if (MERGE_TOOL_CARD and message_id == self._turn_card_id(chat_id, turn)
                     and looks_like_progress(text, self._tool_lines,
