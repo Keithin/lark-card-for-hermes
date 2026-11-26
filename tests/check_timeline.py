@@ -115,6 +115,10 @@ assert mod._strip_gateway_progress(overlay, LABELS) == "## 结论\n\n锁文件�
 kept = "第一段\n\n---\n\n第二段（答复里的水平线）"
 assert mod._strip_gateway_progress(kept, LABELS) == kept, kept
 assert mod._strip_gateway_progress("直接一句答复", LABELS) == "直接一句答复"
+# 标签表拿不到（core 私有符号导入失败）时靠结构识别，且不能吞掉答复
+assert mod._strip_gateway_progress(mod_wall := wall, ()) == ""
+for kept_answer in ("✅ 已完成", "✅ 已完成\n✅ 已同步\n✅ 已归档", "```\n代码块答复\n```"):
+    assert mod._strip_gateway_progress(kept_answer, ()) == kept_answer, kept_answer
 print("OK stream overlay: 流式帧的工具进度覆盖层不进正文，答复里的 --- 原样保留")
 
 # 只剩一个活动回合时，无归属事件才被接受

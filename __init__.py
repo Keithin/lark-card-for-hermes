@@ -596,8 +596,45 @@ def looks_like_progress(
         if stripped in known_lines or _is_progress_line(stripped, labels):
             matched += 1
             continue
+        matched = -1   # 有一行不像进度行：标签判据失效，交给结构兜底
+        break
+    if matched > 0:
+        return True
+    if matched == 0 and bare_fence:
+        return True    # 整段只有围栏（连续 terminal 省掉表头）
+    return _structural_chrome(text)
+
+
+# 行内出现这些就是正文语气，工具栏行不会带
+_PROSE_MARKS = "。！？；：，,"
+_EMOJI_LINE_MAX_CHARS = 80
+
+
+def _structural_chrome(text: str) -> bool:
+    """标签表认不出来时的兜底：整段只有「emoji 开头的短行 + 代码围栏」。
+
+    判据保守 —— 必须带围栏且 emoji 行 ≥2，行内无句读、长度 ≤80。这样「✅ 已完成」
+    「📊 报告：…」这类短答复和普通列表不会被吞；代价是「只有 read_file 行、没有围栏」的
+    残帧可能漏一行进正文（宁漏不吞）。
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not lines or not any(line.startswith("```") for line in lines):
         return False
-    return matched > 0 or bare_fence
+    emoji_lines = 0
+    fenced = False
+    for line in lines:
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        head = line.split(" ", 1)[0]
+        if not head or any(ch.isascii() and ch.isalnum() for ch in head):
+            return False
+        if len(line) > _EMOJI_LINE_MAX_CHARS or any(mark in line for mark in _PROSE_MARKS):
+            return False
+        emoji_lines += 1
+    return emoji_lines >= 2
 
 
 def _is_progress_line(line: str, labels: tuple[str, ...]) -> bool:
@@ -622,9 +659,9 @@ def _strip_gateway_progress(text: str, labels: tuple[str, ...]) -> str:
     if not body.strip():
         return body
     head, separator, tail = body.rpartition("\n\n---\n")
-    if separator and looks_like_progress(tail, {}, labels, True):
+    if separator and looks_like_progress(tail, {}, labels):
         return head
-    if looks_like_progress(body, {}, labels, True):
+    if looks_like_progress(body, {}, labels):
         return ""
     return body
 
@@ -648,6 +685,7 @@ def _core_progress_labels() -> tuple[str, ...]:
     except Exception:
         # 不缓存失败：插件在 gateway 启动早期就会调用一次，那时 agent.display 可能还没可导入，
         # 缓存成 () 会让之后所有进度行都认不出来（2026-11-24 实测的墙卡就是这个）。
+        logger.warning("[feishu-card] core 工具标签不可导入，进度行改用结构识别", exc_info=True)
         return ()
     for name in sorted(labels):
         try:
