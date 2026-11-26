@@ -1,11 +1,10 @@
 name: lark-card-for-hermes
-version: 1.7.10
+version: 1.8.0
 description: >
   Lark Card for Hermes: renders Feishu/Lark outbound messages as interactive cards (cardkit streaming,
-  tool timeline, reasoning panel, native tables, token footer) by replacing only the bundled Feishu
-  adapter's send/edit_message primitives plus process-local lifecycle hooks for the timeline. Uses only
-  the public plugin API (no source patching, no byte-integrity fence), so `hermes update` cannot revert
-  it; any card failure falls back to the bundled text path.
+  tool timeline, reasoning panel, native tables, token footer) via a bundled Feishu adapter subclass
+  and public lifecycle hooks. Does not edit Hermes source files. Internal adapter/hook/SDK contracts
+  remain compatibility dependencies; failed updates preserve the original card for retry.
 author: Keithin
 homepage: https://github.com/Keithin/lark-card-for-hermes
 requires_hermes: ">=0.22.0"

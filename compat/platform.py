@@ -28,7 +28,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 # 版本协调：这是**已跑过本仓库 tests/ 的**范围，不是「只在这段内可用」的硬门禁。
-TESTED_HERMES = ">=0.22.7,<0.24"
+TESTED_HERMES = "v0.23.3, v0.23.4"
 
 _BASE_PACKAGE = "hermes_feishu_bundled"
 

@@ -8,7 +8,7 @@
 
 Renders each Hermes reply in Feishu/Lark as **one live card** that updates in place — status header, tool timeline, collapsible reasoning panel, native tables, token footer, streaming body. One message per turn.
 
-This is a Hermes **platform plugin**. It overrides only the Feishu adapter's outbound `send` / `edit_message` primitives and never touches Hermes source code.
+This is a Hermes **platform plugin**. It subclasses the bundled Feishu adapter, overriding `send`, `edit_message`, `send_final_ledgered` and related card/clarify lifecycle methods without editing Hermes source files.
 
 ![A real Feishu card: status header, a Markdown table rendered as a native table, and a token footer](docs/screenshot-card.png)
 
@@ -29,9 +29,9 @@ This is a Hermes **platform plugin**. It overrides only the Feishu adapter's out
 - **Command center** — the `/commands` menu renders as a three-level card (overview → category → detail) whose buttons navigate categories, go back, or re-dispatch a command; metric commands such as `/status` render as result cards with metric columns.
 - **Switch commands** — `/card-preset` and `/card-activity` change the reading preset and the live tool-call display (`full` / `summary` / `hidden`) on the fly.
 
-### Why it does not break when Hermes upgrades
+### Upgrade compatibility and its limits
 
-This is the design premise. The existing alternative (HFC) **injects hooks into Hermes source** and verifies those files by whole-file byte hash, so every new Hermes release invalidates the patch — its own changelog pins the exact commit it targets (e.g. `9b904dcc22c23...`).
+Avoiding source patches reduces upgrade coupling; it does not remove it. HFC's source-injection approach verifies patched files by whole-file byte hash, so upstream file changes can invalidate its patches.
 
 This project does the opposite:
 
@@ -40,17 +40,32 @@ This project does the opposite:
 | Modifies Hermes source | Yes | **No** |
 | Whole-file byte verification | Yes (breaks on upgrade) | No |
 | Event source | Injected hooks | Official plugin hooks (11 of them, all in `VALID_HOOKS`) |
-| Surface area | Many private symbols | Public `ctx.register_platform`; private seams confined to `compat/` (see `hermes plugins validate` output) |
+| Surface area | Many private symbols | Public `ctx.register_platform` and hooks; internal bundled-adapter registration/loading in `compat/`, plus adapter overrides including `send_final_ledgered` in `__init__.py` |
 | Current-turn state | Process-wide globals | Explicit per-turn registry (`turn_state.py`): platform + session_key + chat/thread, keyed by public `turn_id` |
 
-The rendering logic reuses HFC's rendering stack (MIT, see `hfc/`). That code was **byte-identical** across HFC 5.0.9 → 5.0.13 — upstream's maintenance cost all goes into the source-adaptation layer, which this project does not need.
+The rendering logic reuses and adapts HFC's rendering stack (MIT, see `hfc/`). Hermes adapter internals, hook payloads and the installed `lark-oapi` SDK remain runtime compatibility dependencies.
 
-Even if upstream changes a private function we depend on, the failure mode is **the card degrading to bundled text** (every `send` / `edit` has a fallback path), not Feishu going down.
+Some card send/edit failures have bundled-text fallback paths. Import, registration, method-signature, lifecycle or SDK changes can fail before those paths run; fallback is not a guarantee of delivery or compatibility.
 
 ### Requirements
 
-- Hermes Agent **≥ 0.22** with a plugin system and hooks such as `post_gateway_admission` (tested on 0.23.x; `tests/run_all.py` 13/13 green)
-- `lark-oapi` **1.6.8** — that version's `Client._handle_data_frame` silently drops CARD frames, which makes **card button clicks do nothing**. `hfc/feishu_ws_compat.py` matches that function body by AST hash and repairs it; on a version mismatch it declines automatically (`connect()` logs whether the repair was applied).
+- The manifest declares Hermes Agent **≥ 0.22**, with a plugin system and hooks such as `post_gateway_admission`; this is not proof that every matching version works. The CI matrix targets official **v0.23.3 and v0.23.4** on Python **3.14**; compatibility evidence is the successful run for the exact plugin commit, not this range.
+- A real `lark-oapi` runtime: CI uses real dependencies from `tests/requirements.txt` and tests SDK **1.6.8 / 1.7.5**. The optional WebSocket repair in `hfc/feishu_ws_compat.py` targets the known **1.6.8** `Client._handle_data_frame` body by AST hash and declines mismatches. Neither that repair nor offline CI proves live button delivery on every SDK version.
+
+### v1.8.0 release and upgrade gate
+
+- Authoritative final answers and notices are not classified as tool progress by their text. Unknown preview text is kept; a missing tool label table does not justify deleting prose.
+- Tools, reasoning and usage attach only to an exact turn/session or the task-local gateway route. A sole active Feishu chat is not identity proof; unowned observations are omitted.
+- Finished titles follow answer content. Counts and duration appear in **bold in the footer**, not in the title.
+- Run the same command against a clean official checkout before adding a Hermes version to the tested matrix:
+
+```bash
+python -m venv .venv-test
+.venv-test/bin/python -m pip install -r tests/requirements.txt lark-oapi==1.7.5
+LCH_HERMES_DIR=/path/to/clean/hermes-agent .venv-test/bin/python tests/run_all.py
+```
+
+The runner copies the plugin into a temporary profile with fixture configuration: it does not test against your live config/state. CI checks official Hermes v0.23.3/v0.23.4 with both SDKs. These are offline adapter/registration/identity/rendering tests using fake Feishu transport, **not** a full Hermes install, model run or live Feishu visual/button certification. New versions must pass the gate rather than inherit a blanket compatibility claim. Release only from the exact commit whose compatibility matrix has passed; tag `v1.8.0` must match the manifest version and local checkout. Loading new code still requires a gateway restart.
 
 ### Install
 
@@ -119,8 +134,8 @@ __init__.py          # plugin entry: public ctx.register_platform + 11 hooks + c
 plugin.yaml          # manifest (plugin ID = catalog key = lark-card-for-hermes)
 turn_state.py        # explicit per-turn registry (replaces process-wide current-turn globals)
 compat/              # thin layer over the bundled adapter's registry entry (tested support range)
-tests/               # 13 behavior checks (isolated HERMES_HOME), run_all.py runs them all
-hfc/                 # HFC rendering stack (MIT), used as-is
+tests/               # offline behavior checks (isolated HERMES_HOME), run_all.py discovers check_*.py
+hfc/                 # HFC-derived rendering stack (MIT), with local adaptations
   bridge.py          #   ← new here: event translation layer
   client.py          #   ← new here: minimal REST channel
   render.py session.py cardkit.py card_timeline.py native_tables.py ...
@@ -143,7 +158,7 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 
 把 Hermes 在飞书里的回复渲染成**一张持续更新的卡片**——状态头、工具时间线、可折叠思考面板、原生表格、token 统计、流式正文，一回合一条消息。
 
-这是一个 Hermes **平台插件**：只覆写飞书 adapter 的 `send` / `edit_message` 出口，**不修改 Hermes 源码**。
+这是一个 Hermes **平台插件**：继承内置飞书 adapter，覆写 `send`、`edit_message`、`send_final_ledgered` 及相关卡片/clarify 生命周期方法，**不修改 Hermes 源码文件**。
 
 ![飞书真实卡片：状态头 + Markdown 表格渲染成原生表格 + 可折叠执行过程 + token footer](docs/screenshot-card.png)
 
@@ -164,9 +179,9 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 - **命令中心**：`/commands` 菜单渲染成三层卡（概览 → 分类 → 详情），按钮能跳分类、返回、复投命令；`/status` 这类指标命令渲染成带指标列的结果卡。
 - **切换命令**：`/card-preset`、`/card-activity` 随时切换阅读预设和实时工具调用显示（`full` / `summary` / `hidden`）。
 
-### 为什么不会因为 Hermes 升级而挂
+### 升级兼容性与边界
 
-这是设计前提。已有的同类方案（HFC）**往 Hermes 源码里注入 hook** 并对源码做整文件字节校验，所以 Hermes 每发一个新版本就打不上补丁——它的 changelog 里直接写死要适配的 commit（如 `9b904dcc22c23...`）。
+不打源码补丁能减少升级耦合，但不能消除兼容风险。HFC 的源码注入方案对补丁目标做整文件字节校验，上游文件变化可能使补丁失效。
 
 本项目反过来：
 
@@ -175,17 +190,26 @@ MIT. The `hfc/` directory retains its upstream copyright notice — see `LICENSE
 | 改动 Hermes 源码 | 是 | **否** |
 | 整文件字节校验 | 是（升级即失效） | 否 |
 | 事件来源 | 注入 hook | 官方插件 hook（`VALID_HOOKS` 内的 11 个） |
-| 接口面 | 大量私有符号 | 公开 `ctx.register_platform`；私有接缝集中在 `compat/`（清单见 `hermes plugins validate`） |
+| 接口面 | 大量私有符号 | 公开 `ctx.register_platform` 与 hooks；`compat/` 依赖内置 adapter 注册/加载机制，`__init__.py` 另覆写 `send_final_ledgered` 等内部接口 |
 | 当前回合状态 | 进程级全局变量 | 显式每回合注册表（`turn_state.py`）：platform + session_key + chat/thread，以公开 `turn_id` 标识 |
 
-渲染逻辑直接复用 HFC 的渲染栈（MIT，见 `hfc/`）。那部分代码在 5.0.9 → 5.0.13 之间**逐字节未变**——上游的维护成本全花在源码适配层，而本项目不需要那一层。
+渲染逻辑复用并调整了 HFC 渲染栈（MIT，见 `hfc/`）。Hermes adapter 内部实现、hook 参数和已安装的 `lark-oapi` SDK 都是运行时兼容性依赖。
 
-即便上游改了被依赖的私有函数，失败方式是**卡片退化成内置文本**（每条 `send` / `edit` 都有回落路径），而不是飞书不可用。
+部分卡片发送/编辑错误有内置文本回落路径；导入、注册、方法签名、生命周期或 SDK 变化可能在进入这些路径前就失败。不能保证所有故障都可回落，也不能据此保证消息送达。
 
 ### 依赖
 
-- 带插件系统和 `post_gateway_admission` 等 hooks 的 Hermes Agent **≥ 0.22**（0.23.x 上 `tests/run_all.py` 13/13 全绿）
-- `lark-oapi` **1.6.8** —— 该版本的 `Client._handle_data_frame` 会静默丢弃 CARD 帧，导致**卡片按钮点击无效**。`hfc/feishu_ws_compat.py` 用 AST 精确匹配那段函数体并修掉；版本不符会自动放弃（`connect()` 成功后日志会写明是否修复）。
+- 清单声明 Hermes Agent **≥ 0.22**，需带插件系统和 `post_gateway_admission` 等 hooks；此下限不代表范围内各版本均兼容。CI 矩阵目标是官方 **v0.23.3、v0.23.4** 和 Python **3.14**，兼容证据以对应插件 commit 的成功运行记录为准。
+- 真实的 `lark-oapi` 运行时：CI 使用 `tests/requirements.txt` 中的真实依赖，分别测试 SDK **1.6.8 / 1.7.5**。`hfc/feishu_ws_compat.py` 的可选 WebSocket 修复以 AST 哈希匹配已知 **1.6.8** 的 `Client._handle_data_frame`，不匹配则放弃；该修复和离线 CI 均不能证明所有 SDK 版本的真实按钮投递可用。
+
+### v1.8.0 与升级门槛
+
+- 最终答复和普通通知不再按文本外形判作工具进度；缺少工具标签时，保留无法确认的预览，不能删正文。
+- 工具、推理和用量只绑定精确 turn/session 或任务上下文路由；唯一活动飞书回合不是归属证明，未知事件不展示。
+- 完成卡标题随正文变化；工具次数与耗时只在**尾部加粗**，不再占标题。
+- 新 Hermes 版本先在干净官方源码上执行上方命令，再加入兼容矩阵。测试复制插件到临时 Profile，使用固定测试配置，不读写实际用户配置和检查点。
+- CI 覆盖官方 v0.23.3/v0.23.4 × SDK 1.6.8/1.7.5。它是使用真实依赖、假飞书传输的离线适配器/注册/归属/渲染测试，不等于完整 Hermes 安装、模型或飞书客户端视觉与按钮验收。
+- 只有精确提交的矩阵通过后才发布；tag、manifest 版本和本地 checkout 必须一致。新代码加载仍需重启网关，不能把源码同步当成运行态已加载。
 
 ### 安装
 
@@ -254,8 +278,8 @@ __init__.py          # 插件入口：公开 ctx.register_platform + 11 个 hook
 plugin.yaml          # 插件清单（插件 ID = catalog key = lark-card-for-hermes）
 turn_state.py        # 显式每回合注册表（替代进程级「当前回合」全局变量）
 compat/              # 内置 adapter 条目的薄兼容层（声明并测试支持范围）
-tests/               # 13 项行为判据（隔离 HERMES_HOME），run_all.py 一键全跑
-hfc/                 # HFC 渲染栈（MIT），原样复用
+tests/               # 离线行为判据（隔离 HERMES_HOME），run_all.py 自动发现 check_*.py
+hfc/                 # 基于 HFC 的渲染栈（MIT），含本地调整
   bridge.py          #   ← 本项目新增：事件翻译层
   client.py          #   ← 本项目新增：最小 REST 通道
   render.py session.py cardkit.py card_timeline.py native_tables.py ...

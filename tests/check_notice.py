@@ -6,6 +6,7 @@ message.completed，卡片永远显示「⏳ 执行中」（甚至带着几小�
 """
 from pathlib import Path
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
+import os
 import json
 import sys
 from pathlib import Path

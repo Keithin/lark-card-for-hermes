@@ -7,11 +7,8 @@
   每次入站是**新回合**，带自己的 rows / usage / 投递记录；
 - 公开 `turn_id`（`on_session_end` 等 hook 提供）到达后与回合关联；工具行按 `tool_call_id`、
   子代理按 `subagent_id` 在回合内更新，不按名字配对；
-- 归属不可判定时**不猜**：工具/API 事件只有在「同平台恰好一个活动回合」时才绑定，否则丢弃，
-  该回合的正文仍走原生投递（不跨轮合并）。
-
-`shortcut:` Hermes 的 `pre_tool_call` payload 不带 chat/turn，只能按 session_id 或「唯一活动
-回合」绑定；上游若在 payload 里补 turn_id/chat_id，直接改 `resolve()` 即可，其余逻辑不动。
+- 归属不可判定时不猜：只认已绑定的 turn/session 或任务上下文的精确 session_key；
+  无归属事件丢弃，仅影响辅助展示，不影响最终正文。
 """
 
 from __future__ import annotations
@@ -42,6 +39,7 @@ class Turn:
     usage: dict[str, Any] = field(default_factory=lambda: {"tokens": {}, "model": "", "provider": "", "context": {}})
     adapter_token: str = ""
     session_id: str = ""
+    message_id: str = ""
 
     @property
     def key(self) -> tuple[str, str]:
@@ -63,12 +61,17 @@ class TurnRegistry:
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
     def begin(self, *, platform: str, session_key: str, chat_id: str = "",
-              thread_id: str = "", turn_id: str = "") -> Turn:
+              thread_id: str = "", turn_id: str = "", message_id: str = "") -> Turn:
         """一次入站消息 = 一个新回合；同 key 的旧回合（若还没收尾）被替换。"""
         with self._lock:
             turn = Turn(platform=str(platform or ""), session_key=str(session_key or ""),
                         chat_id=str(chat_id or ""), thread_id=str(thread_id or ""),
-                        turn_id=str(turn_id or uuid.uuid4().hex))
+                        turn_id=str(turn_id or uuid.uuid4().hex), message_id=str(message_id or ""))
+            previous = self._by_key.get(turn.key)
+            if previous is not None:
+                for key, value in list(self._by_session.items()):
+                    if value is previous:
+                        self._by_session.pop(key)
             self._by_key[turn.key] = turn
             self._by_turn_id[turn.turn_id] = turn
             self._order.append(turn.key)
@@ -123,6 +126,14 @@ class TurnRegistry:
                     return turn
             return None
 
+    def for_delivery(self, *, platform: str, session_key: str, message_id: str) -> Optional[Turn]:
+        """The current admitted input, including its ended turn awaiting final delivery."""
+        with self._lock:
+            turn = self._by_key.get((platform, session_key))
+            if turn is None or not message_id or turn.message_id != message_id:
+                return None
+            return turn
+
     def bind_adapter(self, turn: Turn, adapter_token: str) -> bool:
         """第一个给这个 chat 投递的 adapter 拥有该回合；别的实例不接管。"""
         with self._lock:
@@ -131,33 +142,40 @@ class TurnRegistry:
                 return True
             return turn.adapter_token == str(adapter_token or "")
 
-    def resolve(self, *, platform: str, session_id: str = "", turn_id: str = "") -> Optional[Turn]:
-        """工具/API/子代理事件 → 回合。
-
-        优先 turn_id；其次已绑定的 session_id；最后只在「同平台恰好一个活动回合」时绑定。
-        多候选/无候选都返回 None（调用方丢弃该事件，不跨轮合并）。
-        """
+    def resolve(self, *, platform: str, session_id: str = "", turn_id: str = "",
+                session_key: str = "") -> Optional[Turn]:
+        """Resolve exact identities only; a sole active turn is not proof of ownership."""
         with self._lock:
-            if turn_id:
-                turn = self._by_turn_id.get(str(turn_id))
-                if turn is not None:
-                    if session_id and not turn.session_id:
-                        turn.session_id = str(session_id)
-                        self._by_session[(turn.platform, turn.session_id)] = turn
-                    return turn
-            if session_id:
-                bound = self._by_session.get((str(platform or ""), str(session_id)))
-                if bound is not None and not bound.final:
-                    return bound
-            candidates = [t for t in self._by_key.values()
-                          if not t.final and (not platform or t.platform == str(platform))]
-            if len(candidates) != 1:
+            if platform and platform != "feishu":
                 return None
-            turn = candidates[0]
+            bound = self._by_turn_id.get(turn_id) if turn_id else None
+            if bound is None and session_id and not turn_id:
+                bound = self._by_session.get(("feishu", session_id))
+            route = self._by_key.get((platform, session_key)) if platform and session_key else None
+            if bound is not None:
+                if (bound.final or self._by_key.get(bound.key) is not bound
+                        or (platform and bound.platform != platform)):
+                    return None
+                if session_key and bound.session_key != session_key:
+                    return None
+                if session_id and bound.session_id and bound.session_id != session_id:
+                    return None
+                return bound
+            # A task-local exact route may bind Hermes' public turn/session ids to admission.
+            if route is None or route.final:
+                return None
+            if route.session_id and session_id and route.session_id != session_id:
+                return None
+            aliases = [key for key, value in self._by_turn_id.items()
+                       if value is route and key != route.turn_id]
+            if turn_id and aliases and turn_id not in aliases:
+                return None
             if session_id:
-                turn.session_id = str(session_id)
-                self._by_session[(turn.platform, turn.session_id)] = turn
-            return turn
+                route.session_id = session_id
+                self._by_session[(route.platform, session_id)] = route
+            if turn_id:
+                self._by_turn_id[turn_id] = route
+            return route
 
     # ── 内容 ────────────────────────────────────────────────────────────────
     def append_row(self, turn: Turn, row: dict[str, Any]) -> None:

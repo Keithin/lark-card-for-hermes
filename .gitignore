@@ -6,3 +6,5 @@ config.local.json
 *.log
 state/
 config.json
+tests/.hermes-home/
+.venv-test/

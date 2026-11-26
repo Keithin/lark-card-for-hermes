@@ -1,0 +1,55 @@
+name: Hermes compatibility
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: Hermes ${{ matrix.hermes }} / SDK ${{ matrix.sdk }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes: [v0.23.3, v0.23.4]
+        sdk: ['1.6.8', '1.7.5']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lch
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes }}
+          path: hermes
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install real test dependencies
+        run: |
+          python -m venv "$RUNNER_TEMP/lch-venv"
+          "$RUNNER_TEMP/lch-venv/bin/python" -m pip install -r lch/tests/requirements.txt "lark-oapi==${{ matrix.sdk }}"
+          git -C hermes rev-parse HEAD
+          test -z "$(git -C hermes status --porcelain)"
+          "$RUNNER_TEMP/lch-venv/bin/python" -c 'from importlib.metadata import version; print("aiohttp", version("aiohttp"), "lark-oapi", version("lark-oapi"))'
+      - name: Run isolated plugin behavior checks against official source
+        working-directory: lch
+        env:
+          LCH_HERMES_DIR: ${{ github.workspace }}/hermes
+        run: |
+          "$RUNNER_TEMP/lch-venv/bin/python" tests/run_all.py
+          git -C ../hermes diff --exit-code
+      - name: Validate plugin without editing Hermes
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes
+          HERMES_HOME: ${{ runner.temp }}/lch-validate-home
+        run: |
+          "$RUNNER_TEMP/lch-venv/bin/python" -c 'from hermes_cli.main import main; main()' plugins validate "$GITHUB_WORKSPACE/lch"
+          test -z "$(git -C hermes status --porcelain)"

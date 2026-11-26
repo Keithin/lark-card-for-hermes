@@ -13,10 +13,11 @@
 from pathlib import Path
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
+import os
 import importlib.util
 import sys
 
-HERMES = Path.home() / ".hermes/hermes-agent"   # 只读源码树：插件与网关的 import 根
+HERMES = Path(os.environ.get("LCH_HERMES_DIR", str(Path.home() / ".hermes/hermes-agent")))   # 只读源码树：插件与网关的 import 根
 sys.path.insert(0, str(HERMES))
 sys.path.insert(0, REPO_ROOT)                   # compat/ 是插件自己的包
 

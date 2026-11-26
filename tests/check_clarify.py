@@ -10,6 +10,7 @@
 """
 from pathlib import Path
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
+import os
 
 import asyncio
 import importlib.util
@@ -18,8 +19,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-HERMES = Path.home() / ".hermes/hermes-agent"
-PLUGIN = Path.home() / ".hermes/plugins/lark-card-for-hermes/__init__.py"
+HERMES = Path(os.environ.get("LCH_HERMES_DIR", str(Path.home() / ".hermes/hermes-agent")))
+PLUGIN = Path(REPO_ROOT) / "__init__.py"
 sys.path.insert(0, str(HERMES))
 
 from gateway.config import PlatformConfig  # noqa: E402

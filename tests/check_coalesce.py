@@ -5,6 +5,7 @@
 """
 from pathlib import Path
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
+import os
 
 import asyncio
 import importlib.util
@@ -14,8 +15,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-HERMES = Path.home() / ".hermes/hermes-agent"
-PLUGIN = Path.home() / ".hermes/plugins/lark-card-for-hermes/__init__.py"
+HERMES = Path(os.environ.get("LCH_HERMES_DIR", str(Path.home() / ".hermes/hermes-agent")))
+PLUGIN = Path(REPO_ROOT) / "__init__.py"
 sys.path.insert(0, str(HERMES))
 
 from gateway.config import PlatformConfig  # noqa: E402
@@ -66,10 +67,10 @@ async def main() -> None:
     mod.RestClient = lambda *a, **k: fake
 
     mod._on_admission(platform="feishu", source={"chat_id": CHAT})
-    mod._on_pre_tool_call(tool_name="terminal", args={"command": "echo hi"}, tool_call_id="c1")
+    mod._on_pre_tool_call(tool_name="terminal", args={"command": "echo hi"}, tool_call_id="c1", turn_id=mod.REGISTRY.for_chat(platform="feishu", chat_id=CHAT).turn_id)
     line = adapter.format_tool_event(ToolCallChunk(tool_name="terminal", preview="echo hi", args={}))
 
-    first = await adapter.send(CHAT, line)
+    first = await adapter.send(CHAT, line, metadata={"expect_edits": True})
     assert fake.created == 1, fake.created
 
     # 快速发多个 edit，模拟 LLM 流式 delta
@@ -78,7 +79,7 @@ async def main() -> None:
         await adapter.edit_message(CHAT, first.message_id, f"第 {i} 段内容 ▉")
 
     # 最后 finalize
-    mod._on_session_end(platform="feishu")
+    mod._on_session_end(platform="feishu", turn_id=mod.REGISTRY.for_chat(platform="feishu", chat_id=CHAT).turn_id)
     await adapter.edit_message(CHAT, first.message_id, "最终答复", finalize=True)
 
     mutations = [e for e in log if e[0] == "mutation"]

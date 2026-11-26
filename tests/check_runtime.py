@@ -6,14 +6,15 @@
 """
 from pathlib import Path
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
+import os
 
 import importlib.util
 import json
 import sys
 from pathlib import Path
 
-HERMES = Path.home() / ".hermes/hermes-agent"
-PLUGIN = Path.home() / ".hermes/plugins/lark-card-for-hermes/__init__.py"
+HERMES = Path(os.environ.get("LCH_HERMES_DIR", str(Path.home() / ".hermes/hermes-agent")))
+PLUGIN = Path(REPO_ROOT) / "__init__.py"
 sys.path.insert(0, str(HERMES))
 
 from gateway.config import PlatformConfig  # noqa: E402
@@ -34,8 +35,8 @@ from turn_state import REGISTRY  # noqa: E402
 mod._on_admission(platform="feishu", source={"chat_id": CHAT},
                   session_key="agent:main:feishu:dm:oc_runtime_selftest")
 TURN = REGISTRY.active()[-1]
-mod._on_pre_tool_call(tool_name="terminal", args={"command": "echo hi"}, tool_call_id="t1")
-mod._on_post_tool_call(tool_name="terminal", duration_ms=1200, status="ok", tool_call_id="t1")
+mod._on_pre_tool_call(tool_name="terminal", args={"command": "echo hi"}, tool_call_id="t1", turn_id=mod.REGISTRY.for_chat(platform="feishu", chat_id=CHAT).turn_id)
+mod._on_post_tool_call(tool_name="terminal", duration_ms=1200, status="ok", tool_call_id="t1", turn_id=mod.REGISTRY.for_chat(platform="feishu", chat_id=CHAT).turn_id)
 mod._on_session_end(platform="feishu", session_key="agent:main:feishu:dm:oc_runtime_selftest")
 
 card = adapter._card_v2(CHAT, "正文", streaming=True, turn=TURN)

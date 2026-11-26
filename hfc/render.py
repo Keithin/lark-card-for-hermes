@@ -1126,70 +1126,13 @@ def _header_title_with_state(
     interaction = session.active_interaction
     if interaction is not None and interaction.status == "pending":
         return _sanitize_runtime_header(interaction.prompt) or configured_title
-    metrics = _runtime_header_metrics(session, display_status=display_status)
     if display_status == "completed":
-        # Local change 2026-11-20 (禹钊): the title used to be the same configured name on every
-        # card, so finished cards were indistinguishable ("之前 HFC 的标题会根据回复内容修改").
-        # The reply's first real line now leads, and the name survives as the fallback.
         headline = _answer_headline(session) or configured_title
-        return f"✅ {headline}" + (f" · {metrics}" if metrics else "")
+        return f"✅ {headline}"
     if display_status == "failed":
-        # Maintainer note (contract change): this used to collapse to "⛔ <name>", which hid where
-        # the run stopped. The metrics stay for that reason; the action phrase moved to the
-        # sub-title (see ``_header_action_text``) so the title stays an identity line.
-        parts = [f"⛔ {configured_title}"]
-        if metrics:
-            parts.append(metrics)
-        return " · ".join(parts)
-    if not metrics:
-        # Nothing measured: keep the legacy wording rather than a bare "⏳ <name>", which reads as
-        # a label instead of a state. What it is doing now lives on the sub-title.
-        return f"⏳ 执行中 · {configured_title}"
-    # Maintainer note (contract change): the reader's order is name → metrics → prose. The title
-    # used to lead with the phrase ("⏳ 正在读取 · Sales Bot") and carry no numbers at all, so the
-    # elapsed time and tool count lived only in the footer. The user asked for both in the title,
-    # both AFTER the name: "⏳ Sales Bot · 工具 3 · 1m12s". The name stays first because it is what
-    # identifies WHICH conversation is still working.
-    # Maintainer note (contract change 2): the action phrase was then the title's LAST segment
-    # ("… · 正在读取文件"). The user asked for it on the next row ("标题的正在使用之类的，放到第二行"),
-    # so it is rendered as the header sub-title instead.
-    return f"⏳ {configured_title} · {metrics}"
+        return f"⛔ {configured_title}"
+    return f"⏳ 执行中 · {configured_title}"
 
-
-def _runtime_header_metrics(session: CardSession, *, display_status: str) -> str:
-    """``"工具 3 · 1m12s"`` for the header — the numbers the user asked to see up there.
-
-    Maintainer note (contract change): the order used to be elapsed then tool count. The user
-    asked for the COUNT first, so the title reads name → how many tools → how long → what it is
-    doing. Elapsed comes from the same source the footer uses (live clock while running, the
-    recorded duration once done). Sub-second elapsed is omitted: a freshly started turn would
-    otherwise open with "0s", which reads as a broken clock rather than "just started".
-    """
-    parts: list[str] = []
-    if session.tool_count:
-        # Maintainer note (contract change): the user asked for a hash before the count
-        # ("工具 #3"), so it reads as a numbered tally rather than prose.
-        parts.append(f"工具 #{session.tool_count}")
-    # A stopped turn is over too: report the recorded duration instead of a live clock that keeps
-    # climbing after the run ended.
-    finished = (
-        display_status in {"completed", "failed"}
-        or session.status in {"completed", "failed"}
-    )
-    if finished:
-        try:
-            duration = float(session.duration)
-        except (TypeError, ValueError):
-            duration = 0.0
-        if duration >= 1.0:
-            parts.append(_format_duration(duration))
-    else:
-        created_at = session.created_at
-        if created_at:
-            elapsed = max(0.0, _time.time() - float(created_at))
-            if elapsed >= 1.0:
-                parts.append(_format_duration(elapsed))
-    return " · ".join(parts)
 
 
 def _runtime_header_summary(session: CardSession) -> str:
@@ -2802,13 +2745,13 @@ def _render_footer(
         # during the run legitimately shows no counts rather than a fake ↑0 ↓0).
         waiting: list[str] = []
         if session.tool_count and not compact and tool_activity != "hidden":
-            waiting.append(f"工具 #{session.tool_count}")
+            waiting.append(f"**工具 #{session.tool_count}**")
         if session.created_at:
             # Only once there is a second to show: a freshly-armed approval would otherwise read
             # "0s · 等待选择 · ⏳ 5 分钟后过期", which is noise, not information.
             elapsed = max(0.0, _time.time() - float(session.created_at))
             if elapsed >= 1.0:
-                waiting.append(_format_duration(elapsed))
+                waiting.append(f"**{_format_duration(elapsed)}**")
         if include_status:
             waiting.append("等待选择")
         waiting.append(f"⏳ {minutes} 分钟后过期")
@@ -2828,9 +2771,9 @@ def _render_footer(
         # time then count here).
         running = [f"{_spinner_frame()} {_status_tag('执行中', 'blue')}"] if include_status else []
         if session.tool_count and not compact and tool_activity != "hidden":
-            # Maintainer note (contract change): hash before the count, matching the title.
-            running.append(f"工具 #{session.tool_count}")
-        running.append(_format_duration(max(0.0, _time.time() - float(session.created_at))))
+            # Runtime metrics live in the footer, not the title.
+            running.append(f"**工具 #{session.tool_count}**")
+        running.append(f"**{_format_duration(max(0.0, _time.time() - float(session.created_at)))}**")
         # Maintainer note (contract change): the footer repeats the title's action phrase
         # ("正在读取文件") so the state line reads the same wherever the eye lands — the user
         # asked for it explicitly.
@@ -2884,7 +2827,7 @@ def _render_footer(
     ):
         return pill
     values = {
-        "duration": _format_duration(duration),
+        "duration": f"**{_format_duration(duration)}**",
         # Local change 2026-11-04: model colored even in task/compact mode (_colored_model_label escapes internally).
         "model": _colored_model_label(model),
         "input_tokens": f"↑{_format_count(input_tokens)}",
@@ -2898,9 +2841,8 @@ def _render_footer(
     }
     selected = []
     if session.tool_count and not compact:
-        # Maintainer note (contract change): the count leads the other metrics, matching the title
-        # (it used to be appended last, after ctx); it carries a hash, per the user's request.
-        selected.append(f"工具 #{session.tool_count}")
+        # Runtime metrics live in the footer, not the title.
+        selected.append(f"**工具 #{session.tool_count}**")
     fields = DEFAULT_FOOTER_FIELDS if footer_fields is None else footer_fields
     available = {
         "duration": duration > 0, "model": model != "Unknown",

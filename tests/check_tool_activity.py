@@ -5,11 +5,12 @@
 """
 from pathlib import Path
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
+import os
 
 import sys
 from pathlib import Path
 
-HERMES = Path.home() / ".hermes/hermes-agent"
+HERMES = Path(os.environ.get("LCH_HERMES_DIR", str(Path.home() / ".hermes/hermes-agent")))
 sys.path.insert(0, str(HERMES))
 sys.path.insert(0, REPO_ROOT)
 
@@ -91,6 +92,18 @@ def main() -> None:
             name=tool, tool_id=f"tt{ordinal}", status="completed",
             detail=f"{tool} 详情\n耗时: 12ms",
         )
+    # 指标只在尾部加粗，运行/完成/失败的标题均不再附加次数和耗时。
+    from hfc.render import _render_footer, _header_title_with_state
+    done.duration = 8.0
+    for state in ("thinking", "completed", "failed"):
+        done.status = state
+        header = _header_title_with_state(done, "Hermes Agent", display_status=state)
+        assert "工具 #" not in header and " · 8s" not in header, header
+        footer = _render_footer(done, display_status=state)
+        assert "**工具 #2**" in footer, footer
+        if state != "thinking":
+            assert "**8s**" in footer, footer
+    done.status = "completed"
     done_card = render_card(done)
     title = done_card["header"]["title"]["content"]
     assert title.startswith("✅ 锁文件堆积是根因"), title

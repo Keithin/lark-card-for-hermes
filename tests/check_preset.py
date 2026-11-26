@@ -13,6 +13,7 @@
 """
 from pathlib import Path
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
+import os
 
 import importlib.util
 import json
@@ -21,8 +22,8 @@ import tempfile
 import types
 from pathlib import Path
 
-HERMES = Path.home() / ".hermes/hermes-agent"
-PLUGIN = Path.home() / ".hermes/plugins/lark-card-for-hermes/__init__.py"
+HERMES = Path(os.environ.get("LCH_HERMES_DIR", str(Path.home() / ".hermes/hermes-agent")))
+PLUGIN = Path(REPO_ROOT) / "__init__.py"
 sys.path.insert(0, str(HERMES))
 
 spec = importlib.util.spec_from_file_location("lark_cards_plugin", PLUGIN)

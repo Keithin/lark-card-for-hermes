@@ -6,14 +6,15 @@
 """
 from pathlib import Path
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
+import os
 
 import importlib.util
 import json
 import sys
 from pathlib import Path
 
-PLUGIN = Path.home() / ".hermes/plugins/lark-card-for-hermes/__init__.py"
-AGENT_TREE = Path.home() / ".hermes/hermes-agent"
+PLUGIN = Path(REPO_ROOT) / "__init__.py"
+AGENT_TREE = Path(os.environ.get("LCH_HERMES_DIR", str(Path.home() / ".hermes/hermes-agent")))
 sys.path.insert(0, str(AGENT_TREE))
 
 spec = importlib.util.spec_from_file_location("lark_cards_plugin", PLUGIN)
@@ -39,15 +40,15 @@ assert mod._timeline_text(turn, final=False) == "", "回合刚开始时不该有
 assert mod._timeline_text(None, final=False) == "", "没有回合时不该渲染时间线"
 
 # 并行同名工具：按 tool_call_id 收尾，不能按名字配错
-mod._on_pre_tool_call(tool_name="terminal", args={"command": "a"}, tool_call_id="t1")
-mod._on_pre_tool_call(tool_name="terminal", args={"command": "b"}, tool_call_id="t2")
-mod._on_post_tool_call(tool_name="terminal", duration_ms=1500, status="ok", tool_call_id="t2")
+mod._on_pre_tool_call(tool_name="terminal", args={"command": "a"}, tool_call_id="t1", turn_id=turn.turn_id)
+mod._on_pre_tool_call(tool_name="terminal", args={"command": "b"}, tool_call_id="t2", turn_id=turn.turn_id)
+mod._on_post_tool_call(tool_name="terminal", duration_ms=1500, status="ok", tool_call_id="t2", turn_id=turn.turn_id)
 rows = {r["id"]: r for r in turn.rows}
 assert rows["t2"]["status"] == "ok" and rows["t1"]["status"] == "running", rows
-mod._on_post_tool_call(tool_name="terminal", duration_ms=250, status="error", tool_call_id="t1")
+mod._on_post_tool_call(tool_name="terminal", duration_ms=250, status="error", tool_call_id="t1", turn_id=turn.turn_id)
 
-mod._on_subagent_start(child_role="researcher", child_goal="勘察现场", child_subagent_id="s1")
-mod._on_subagent_stop(child_status="ok", duration_ms=4200, child_subagent_id="s1")
+mod._on_subagent_start(child_role="researcher", child_goal="勘察现场", child_subagent_id="s1", turn_id=turn.turn_id)
+mod._on_subagent_stop(child_status="ok", duration_ms=4200, child_subagent_id="s1", turn_id=turn.turn_id)
 rendered = mod._timeline_text(turn, final=False)
 assert "1. terminal" in rendered and "1.5s" in rendered and "❌" in rendered, rendered
 assert "子代理·researcher" in rendered, rendered
@@ -115,18 +116,18 @@ assert mod._strip_gateway_progress(overlay, LABELS) == "## 结论\n\n锁文件�
 kept = "第一段\n\n---\n\n第二段（答复里的水平线）"
 assert mod._strip_gateway_progress(kept, LABELS) == kept, kept
 assert mod._strip_gateway_progress("直接一句答复", LABELS) == "直接一句答复"
-# 标签表拿不到（core 私有符号导入失败）时靠结构识别，且不能吞掉答复
-assert mod._strip_gateway_progress(mod_wall := wall, ()) == ""
+# 标签表不可用时保留内容，不再靠外形猜测并删除
+assert mod._strip_gateway_progress(wall, ()) == wall
 for kept_answer in ("✅ 已完成", "✅ 已完成\n✅ 已同步\n✅ 已归档", "```\n代码块答复\n```"):
     assert mod._strip_gateway_progress(kept_answer, ()) == kept_answer, kept_answer
 print("OK stream overlay: 流式帧的工具进度覆盖层不进正文，答复里的 --- 原样保留")
 
-# 只剩一个活动回合时，无归属事件才被接受
+# 即使只剩一个活动回合，无归属事件仍不得被接受
 only = REGISTRY.active()[-1] if REGISTRY.active() else None
 for t in list(REGISTRY.active()):
     if t is not only:
         REGISTRY.end(t)
 mod._on_pre_tool_call(tool_name="unique_tool", args={}, tool_call_id="t7")
-assert [r["name"] for r in REGISTRY.active()[0].rows][-1] == "unique_tool"
+assert all(r["name"] != "unique_tool" for t in REGISTRY.active() for r in t.rows)
 
 print("OK timeline/registry checks")

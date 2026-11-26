@@ -187,7 +187,7 @@ def _header_for_v1(chat_id: str, turn: Optional["Turn"] = None) -> tuple[str, st
     """v1 兜底卡的标题/配色取 HFC 渲染出的 header（状态头+工具数+时长），取不到才退回配置名。"""
     try:
         # 键的先后：本回合的真实键 → 回合外 chat 键 → 旧式裸 chat 键（遗留检查点/直接调用）
-        keys = ([f"feishu:{turn.chat_id}:{turn.thread_id}"] if turn is not None else []) + \
+        keys = ([_bridge_key(turn)] if turn is not None else []) + \
                [f"feishu:{chat_id}:", str(chat_id)]
         with _TURNS_LOCK:
             card = None
@@ -386,8 +386,8 @@ def _stale_card(record: dict) -> Optional[dict]:
 
 
 def _bridge_key(turn: Turn) -> str:
-    """HFC 显示状态的键：平台 + chat + thread（双 adapter/双话题互不覆盖）。"""
-    return f"{turn.platform}:{turn.chat_id}:{turn.thread_id}"
+    """HFC 显示状态按回合隔离；同 chat/thread 连续两问也不能覆盖彼此。"""
+    return f"{turn.platform}:{turn.chat_id}:{turn.thread_id}:{turn.turn_id}"
 
 
 def _append(turn: Optional[Turn], row: dict | None = None, **kwargs: Any) -> None:
@@ -405,7 +405,8 @@ def _complete(turn: Optional[Turn], *, kind: str, ident: str = "", name: str = "
     REGISTRY.complete_row(turn, kind=kind, ident=ident, name=name, status=status, ms=ms)
 
 
-def _on_admission(platform: str = "", source: Any = None, session_key: str = "", **_kw: Any) -> None:
+def _on_admission(platform: str = "", source: Any = None, session_key: str = "",
+                  message_id: str = "", **_kw: Any) -> None:
     """一次入站消息 = 一个回合：注册新回合，并给 HFC 状态机开新 session。"""
     if platform != "feishu":
         return
@@ -413,6 +414,7 @@ def _on_admission(platform: str = "", source: Any = None, session_key: str = "",
     turn = REGISTRY.begin(
         platform=platform, session_key=str(session_key or ""),
         chat_id=str(src.get("chat_id") or ""), thread_id=str(src.get("thread_id") or ""),
+        message_id=message_id or str(src.get("message_id") or ""),
     )
     publish_canonical_turn_id(turn.turn_id)
     if turn.chat_id:
@@ -420,11 +422,22 @@ def _on_admission(platform: str = "", source: Any = None, session_key: str = "",
             _TURNS.start(_bridge_key(turn))
 
 
+def _event_turn(*, platform: str = "", session_id: str = "", turn_id: str = "",
+                session_key: str = "", **_kw: Any) -> Optional[Turn]:
+    try:
+        from .compat.events import event_route
+    except ImportError:
+        from compat.events import event_route
+    route_platform, route_key = event_route(platform, session_key)
+    return REGISTRY.resolve(platform=route_platform, session_id=session_id,
+                            turn_id=turn_id, session_key=route_key)
+
+
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, tool_call_id: str = "",
                       session_id: str = "", platform: str = "", **_kw: Any) -> None:
     name = tool_name or "tool"
     preview = _preview(name, args)
-    turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id)
+    turn = _event_turn(platform=platform, session_id=session_id, **_kw)
     if turn is None:          # 归属不可判定：不跨轮合并，正文仍走原生投递
         return
     _append(turn, kind="tool", id=str(tool_call_id or name), name=name,
@@ -438,7 +451,7 @@ def _on_post_tool_call(tool_name: str = "", duration_ms: Any = 0, status: str = 
                        tool_call_id: str = "", session_id: str = "", platform: str = "",
                        **_kw: Any) -> None:
     ok = str(status).lower() not in {"error", "blocked", "cancelled", "canceled"}
-    turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id)
+    turn = _event_turn(platform=platform, session_id=session_id, **_kw)
     if turn is None:
         return
     _complete(turn, kind="tool", ident=str(tool_call_id or ""), name=tool_name or "",
@@ -453,7 +466,7 @@ def _on_subagent_start(child_role: str = "", child_goal: str = "", child_subagen
                        session_id: str = "", platform: str = "", **_kw: Any) -> None:
     name = f"子代理·{child_role}" if child_role else "子代理"
     goal = _preview("delegate_task", {"goal": child_goal})
-    turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id)
+    turn = _event_turn(platform=platform, session_id=session_id, **_kw)
     if turn is None:
         return
     _append(turn, kind="agent", id=str(child_subagent_id or name), name=name,
@@ -467,7 +480,7 @@ def _on_subagent_stop(child_status: str = "", duration_ms: Any = 0, child_subage
                       child_role: str = "", session_id: str = "", platform: str = "",
                       **_kw: Any) -> None:
     ok = str(child_status).lower() in {"", "ok", "done", "completed", "success"}
-    turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id)
+    turn = _event_turn(platform=platform, session_id=session_id, **_kw)
     if turn is None:
         return
     _complete(turn, kind="agent", ident=str(child_subagent_id or ""),
@@ -483,7 +496,7 @@ def _on_session_end(platform: str = "", session_id: str = "", turn_id: str = "",
                     **_kw: Any) -> None:
     if platform and platform != "feishu":   # 别的平台（CLI/桌面）结束回合不能冻结飞书的回合
         return
-    turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id, turn_id=turn_id)
+    turn = _event_turn(platform=platform, session_id=session_id, turn_id=turn_id, **_kw)
     if turn is None or turn.final:
         return
     REGISTRY.end(turn)
@@ -496,7 +509,7 @@ def _on_stream_delta(delta: str = "", kind: str = "", session_id: str = "", plat
     """推理流要显式订阅；正文流由适配器喂，这里只取 reasoning（且尊重采集开关）。"""
     if kind != "reasoning" or not delta:
         return
-    turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id)
+    turn = _event_turn(platform=platform, session_id=session_id, **_kw)
     if turn is None:
         return
     with _TURNS_LOCK:
@@ -506,7 +519,7 @@ def _on_stream_delta(delta: str = "", kind: str = "", session_id: str = "", plat
 def _on_post_api_request(usage: Any = None, model: str = "", provider: str = "",
                          session_id: str = "", platform: str = "", **_kw: Any) -> None:
     """HFC 的 footer 要 model/tokens/context；这些只有 API 层知道。"""
-    turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id)
+    turn = _event_turn(platform=platform, session_id=session_id, **_kw)
     if turn is None:
         return
     if isinstance(usage, dict):
@@ -522,7 +535,7 @@ def _on_agent_loop_stopped(reason: str = "", platform: str = "", session_id: str
     """被 /stop 或中断打断：卡片必须走失败态，不能一直转圈。"""
     if platform and platform != "feishu":
         return
-    turn = REGISTRY.resolve(platform=platform or "feishu", session_id=session_id, turn_id=turn_id)
+    turn = _event_turn(platform=platform, session_id=session_id, turn_id=turn_id, **_kw)
     if turn is None:
         return
     with _TURNS_LOCK:
@@ -602,39 +615,7 @@ def looks_like_progress(
         return True
     if matched == 0 and bare_fence:
         return True    # 整段只有围栏（连续 terminal 省掉表头）
-    return _structural_chrome(text)
-
-
-# 行内出现这些就是正文语气，工具栏行不会带
-_PROSE_MARKS = "。！？；：，,"
-_EMOJI_LINE_MAX_CHARS = 80
-
-
-def _structural_chrome(text: str) -> bool:
-    """标签表认不出来时的兜底：整段只有「emoji 开头的短行 + 代码围栏」。
-
-    判据保守 —— 必须带围栏且 emoji 行 ≥2，行内无句读、长度 ≤80。这样「✅ 已完成」
-    「📊 报告：…」这类短答复和普通列表不会被吞；代价是「只有 read_file 行、没有围栏」的
-    残帧可能漏一行进正文（宁漏不吞）。
-    """
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    if not lines or not any(line.startswith("```") for line in lines):
-        return False
-    emoji_lines = 0
-    fenced = False
-    for line in lines:
-        if line.startswith("```"):
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
-        head = line.split(" ", 1)[0]
-        if not head or any(ch.isascii() and ch.isalnum() for ch in head):
-            return False
-        if len(line) > _EMOJI_LINE_MAX_CHARS or any(mark in line for mark in _PROSE_MARKS):
-            return False
-        emoji_lines += 1
-    return emoji_lines >= 2
+    return False
 
 
 def _is_progress_line(line: str, labels: tuple[str, ...]) -> bool:
@@ -643,9 +624,10 @@ def _is_progress_line(line: str, labels: tuple[str, ...]) -> bool:
     前缀必须是 emoji（不含 ASCII 字母数字），这样「✅ 已完成」「📊 数据如下」这类短答复不会被吞。
     """
     head, _, rest = str(line or "").partition(" ")
-    if not head or any(ch.isascii() and ch.isalnum() for ch in head):
+    if not head or not any(ord(ch) >= 0x1F000 or 0x2600 <= ord(ch) <= 0x27FF for ch in head):
         return False
-    return any(rest.startswith(label) for label in labels)
+    return any(rest == label or rest.startswith(label + " ") or rest.startswith(label + " ·")
+               for label in labels)
 
 
 def _strip_gateway_progress(text: str, labels: tuple[str, ...]) -> str:
@@ -685,7 +667,7 @@ def _core_progress_labels() -> tuple[str, ...]:
     except Exception:
         # 不缓存失败：插件在 gateway 启动早期就会调用一次，那时 agent.display 可能还没可导入，
         # 缓存成 () 会让之后所有进度行都认不出来（2026-11-24 实测的墙卡就是这个）。
-        logger.warning("[feishu-card] core 工具标签不可导入，进度行改用结构识别", exc_info=True)
+        logger.warning("[feishu-card] core 工具标签不可导入，保留无法确认的预览正文", exc_info=True)
         return ()
     for name in sorted(labels):
         try:
@@ -780,7 +762,8 @@ def _build_adapter_class(base: Any) -> type:
             self._card_streams: dict[str, dict] = {}   # message_id -> {card_id, element_id: text}
             self._tool_lines: dict[str, int] = {}      # 我们生成的工具行（用于识别进度气泡）
             self._last_progress_frame = False          # 上一帧是工具进度（连续围栏块据此识别）
-            self._turn_card: dict[str, tuple[float, str]] = {}   # chat_id -> (turn_started, message_id)
+            self._turn_card: dict[str, tuple[str, str]] = {}   # chat_id -> (turn_id, message_id)
+            self._card_turns: dict[str, Turn] = {}   # exact ownership for delayed edits
             self._segments: dict[str, list[str]] = {}  # message_id -> 答复正文段
             self._dead_remap: dict[str, str] = {}      # 坏卡 message_id -> 顶替它的新消息
             self._cardkit: Optional[CardKitTransport] = None
@@ -792,17 +775,16 @@ def _build_adapter_class(base: Any) -> type:
         def _turn_for(self, chat_id: str, metadata: Optional[dict] = None) -> Optional["Turn"]:
             """这个 chat/thread 是否属于本 adapter 的进行中回合（不是就返回 None）。"""
             thread_id = str((metadata or {}).get("thread_id") or "")
-            turn = REGISTRY.for_chat(platform="feishu", chat_id=str(chat_id or ""), thread_id=thread_id)
+            final_id = (metadata or {}).get("_lch_final_turn_id")
+            turn = (REGISTRY.by_turn_id(final_id) if final_id else
+                    REGISTRY.for_chat(platform="feishu", chat_id=str(chat_id or ""), thread_id=thread_id))
+            if turn is not None and (turn.chat_id != chat_id or turn.thread_id != thread_id):
+                return None
             if turn is None:
                 return None
             if not REGISTRY.bind_adapter(turn, self._adapter_token):
                 return None      # 已被另一个 adapter 实例持有：不接管、不串卡
             return turn
-
-        @staticmethod
-        def _bridge_key_for(chat_id: str, metadata: Optional[dict] = None) -> str:
-            thread_id = str((metadata or {}).get("thread_id") or "")
-            return f"feishu:{chat_id}:{thread_id}"
 
         # ── clarify 按钮卡 ──────────────────────────────────────────────────────
         # 照内置审批卡的线程模型（同步回调 + _submit_on_loop + _card_response）和卡片点击校验
@@ -1035,7 +1017,6 @@ def _build_adapter_class(base: Any) -> type:
             """本回合属于这个 chat 的合并卡；回合变了就当没有。"""
             entry = self._turn_card.get(chat_id)
             if not entry or turn is None or entry[0] != turn.turn_id:
-                self._turn_card.pop(chat_id, None)
                 return None
             return entry[1]
 
@@ -1044,6 +1025,10 @@ def _build_adapter_class(base: Any) -> type:
             if not message_id:
                 return
             self._turn_card[chat_id] = ((turn.turn_id if turn else ""), message_id)
+            if turn is not None:
+                self._card_turns[message_id] = turn
+                if len(self._card_turns) > 256:
+                    self._card_turns.pop(next(iter(self._card_turns)))
             if len(self._segments) > 128:  # ids/segments only matter for this process
                 self._segments.clear()
 
@@ -1058,7 +1043,8 @@ def _build_adapter_class(base: Any) -> type:
         def _card_v2(self, chat_id: str, text: str, *, streaming: bool,
                      turn: Optional["Turn"] = None) -> dict:
             """卡片由 HFC 的 `render_card` 生成（显示模式与 HFC 同一份代码）；不可用时退回最小卡。"""
-            key = f"feishu:{chat_id}:{turn.thread_id}" if turn is not None else f"feishu:{chat_id}:"
+            key = (_bridge_key(turn) if turn is not None
+                   else f"notice:{chat_id}:{uuid.uuid4().hex}")
             with _TURNS_LOCK:
                 # 回合外的发送（启动通知/cron/命令回复）不是本回合：按 notice 渲染并立即收尾，
                 # 否则新建的 session 收不到 complete，卡片永远停在「⏳ 执行中」。
@@ -1085,6 +1071,17 @@ def _build_adapter_class(base: Any) -> type:
             self._tool_lines[line] = self._tool_lines.get(line, 0) + 1
             return line
 
+        async def send_final_ledgered(self, event, session_key, text_content, metadata, **kwargs):
+            # 最终答复有明确的入站 session；通知不经过此入口，不借时间窗口合并。
+            metadata = dict(metadata or {})
+            turn = REGISTRY.for_delivery(
+                platform="feishu", session_key=session_key,
+                message_id=str(getattr(event, "message_id", "") or ""))
+            if turn is not None and turn.chat_id == event.source.chat_id:
+                metadata["_lch_final_turn_id"] = turn.turn_id
+            return await super().send_final_ledgered(
+                event, session_key, text_content, metadata, **kwargs)
+
         # ── send ────────────────────────────────────────────────────────────────
         async def send(
             self, chat_id: str, content: str, reply_to: Optional[str] = None,
@@ -1098,13 +1095,16 @@ def _build_adapter_class(base: Any) -> type:
                     or transient_notice_recall_seconds(formatted) is not None
                     or _delivery_policy().decide(chat_id).disposition == NATIVE_DISPOSITION):
                 return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
-            turn = self._turn_for(chat_id, metadata)
-            # 不按回合门控：流式帧常常解析不到回合（另一个 adapter 实例持有），
-            # 门控住就等于把工具栏原样写进正文（2026-11-26 实测）。
-            cleaned = _strip_gateway_progress(content, progress_labels(turn))
+            owned = bool((metadata or {}).get("expect_edits")
+                         or (metadata or {}).get("_lch_final_turn_id"))
+            turn = self._turn_for(chat_id, metadata) if owned else None
+            # Only editable previews may contain a core overlay; final/notice text is authoritative.
+            preview = bool(turn and (metadata or {}).get("expect_edits")
+                           and not (metadata or {}).get("_lch_final_turn_id"))
+            cleaned = _strip_gateway_progress(content, progress_labels(turn)) if preview else content
             if cleaned != content:
                 formatted = self.format_message(cleaned) if cleaned.strip() else ""
-            is_progress = MERGE_TOOL_CARD and looks_like_progress(
+            is_progress = preview and MERGE_TOOL_CARD and looks_like_progress(
                 formatted, self._tool_lines, progress_labels(turn),
                 self._last_progress_frame,
             )
@@ -1129,9 +1129,8 @@ def _build_adapter_class(base: Any) -> type:
                                    result.error)
                 except Exception as exc:
                     logger.warning("[feishu-card] command card failed, using normal path: %s", exc)
-            # 回合已收尾（final）就不能再合并：否则回合外的同 chat 消息（定时任务/通知）
-            # 会被当成本回合第二次 send，直接改写上一条答复卡。
-            if MERGE_TOOL_CARD and turn is not None and not turn.final:
+            # 只有活动回合或最终投递入口显式标记的回合能复用卡；普通通知不合并。
+            if MERGE_TOOL_CARD and turn is not None:
                 existing = self._turn_card_id(chat_id, turn)
                 if existing and self._cardkit is not None:
                     # 本回合已有卡：第二次 send 转成对同一张卡的更新（网关会 adopt 返回的 id）
@@ -1139,20 +1138,20 @@ def _build_adapter_class(base: Any) -> type:
                         updated = await self._cardkit.update(
                             existing,
                             self._card_v2(chat_id, "" if is_progress else formatted,
-                                          streaming=True, turn=turn))
+                                          streaming=not turn.final, turn=turn))
                         # update() 返回 False = 飞书没接受这次变更：不能报成功
                         if not updated:
                             raise RuntimeError("cardkit update returned False")
                         return SendResult(success=True, message_id=existing)
                     except Exception as exc:
-                        logger.warning("[feishu-card] merged card update failed, sending fresh: %s", exc)
-                        self._turn_card.pop(chat_id, None)
+                        logger.warning("[feishu-card] merged card update failed, keeping card: %s", exc)
+                        return SendResult(success=False, message_id=existing, error=str(exc))
             # 进度行只喂 timeline，正文那格留空给答复
             result = await self._send_card(chat_id, "" if is_progress else formatted, content,
                                            reply_to, metadata, turn=turn)
-            if result is not None and getattr(result, "message_id", ""):
+            if result is not None and getattr(result, "message_id", "") and turn is not None:
                 self._remember_turn_card(chat_id, result.message_id, turn)
-                _TURNS.checkpoint(self._bridge_key_for(chat_id, metadata), result.message_id)
+                _TURNS.checkpoint(_bridge_key(turn), result.message_id)
             return result
 
         async def _send_card(self, chat_id: str, main: str, content: str, reply_to, metadata,
@@ -1200,7 +1199,7 @@ def _build_adapter_class(base: Any) -> type:
             key = self._delivery_key(chat_id, turn)
             logger.info("[feishu-card] stream key=%s", key)
             return await self._transport().send(
-                chat_id, self._card_v2(chat_id, text, streaming=True, turn=turn),
+                chat_id, self._card_v2(chat_id, text, streaming=bool(turn and not turn.final), turn=turn),
                 delivery_uuid=key, reply_to_message_id=reply_to,
             )
 
@@ -1208,16 +1207,19 @@ def _build_adapter_class(base: Any) -> type:
         async def edit_message(
             self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
         ):
+            from gateway.platforms.base import SendResult
             text = self.format_message(content)
-            turn = self._turn_for(chat_id)
+            message_id = self._dead_remap.get(message_id, message_id)
+            turn = self._card_turns.get(message_id)
+            if turn is not None and turn.chat_id != chat_id:
+                return SendResult(success=False, message_id=message_id, error="card belongs to another chat")
             chrome_labels = progress_labels(turn)
-            cleaned = _strip_gateway_progress(content, chrome_labels)
+            cleaned = content if finalize else _strip_gateway_progress(content, chrome_labels)
             if cleaned != content:
                 text = self.format_message(cleaned) if cleaned.strip() else ""
                 logger.info("[feishu-card] edit chrome stripped labels=%d turn=%s",
                             len(chrome_labels), bool(turn))
-            message_id = self._dead_remap.get(message_id, message_id)  # 上一帧顶替过的新消息
-            if (MERGE_TOOL_CARD and message_id == self._turn_card_id(chat_id, turn)
+            if (not finalize and MERGE_TOOL_CARD and message_id == self._turn_card_id(chat_id, turn)
                     and looks_like_progress(text, self._tool_lines,
                                             progress_labels(turn), self._last_progress_frame)):
                 text = ""   # 进度帧只刷时间线：正文由 HFC session 自己保有
@@ -1229,14 +1231,18 @@ def _build_adapter_class(base: Any) -> type:
                 try:
                     # update() 返回 False = 飞书没接受这次变更（不是异常）：不能报成功。
                     if await self._cardkit.update(
-                        message_id, self._card_v2(chat_id, text, streaming=not finalize, turn=turn)
+                        message_id, self._card_v2(chat_id, text, streaming=bool(turn and not turn.final and not finalize), turn=turn)
                     ):
-                        _TURNS.checkpoint(f"feishu:{chat_id}:{(turn.thread_id if turn else '')}", message_id)
+                        if turn is not None and not turn.final and not finalize:
+                            _TURNS.checkpoint(_bridge_key(turn), message_id)
                         return SendResult(success=True, message_id=message_id)
-                    logger.warning("[feishu-card] cardkit update returned False, falling back")
+                    if message_id in self._cardkit.entities:
+                        return SendResult(success=False, message_id=message_id,
+                                          error="cardkit update failed; retry the same card")
                 except Exception as exc:
-                    # 卡片更新失败不能让正文丢掉：交回内置编辑/发送路径
-                    logger.warning("[feishu-card] cardkit update failed, falling back: %s", exc)
+                    logger.warning("[feishu-card] cardkit update failed: %s", exc)
+                    if message_id in self._cardkit.entities:
+                        return SendResult(success=False, message_id=message_id, error=str(exc))
             if message_id in self._card_messages:
                 try:
                     models = _sdk_models()

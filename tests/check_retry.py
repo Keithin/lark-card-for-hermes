@@ -7,6 +7,7 @@
 """
 from pathlib import Path
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
+import os
 import asyncio
 import importlib.util
 import sys
